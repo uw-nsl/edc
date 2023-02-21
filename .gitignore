@@ -8,7 +8,7 @@ __pycache__
 *.egg-info
 
 # Generated files
-data
-logs
-preds
-playground
+/data
+/logs
+/preds
+/playground
