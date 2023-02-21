@@ -1,0 +1,220 @@
+#! /usr/bin/env python3
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import logging, os
+from zipfile import ZipFile, ZIP_DEFLATED
+from argparse import ArgumentParser
+
+from edc import utils
+from edc.data import METADATA_PATH
+
+if TYPE_CHECKING:
+    from typing import TypedDict
+
+    from edc.types import TODDialog, TODRound, TODAction, TODDomainAction, TODSpans, TODDomainSpans, \
+        TODState, TODDomainState, TODMetadata
+    
+    class WoZBeliefStateItem(TypedDict):
+        slots: list[list[str]]
+        act: str
+    
+    WoZTurnLabel = list[list[str]]
+    WoZBeliefState = list[WoZBeliefStateItem]
+    WoZSystemAction = list[str]
+
+    class WoZTurn(TypedDict, total=False):
+        
+        turn_label: WoZTurnLabel
+        system_transcript: str
+        belief_state: WoZBeliefState
+        transcript: str
+        system_acts: WoZSystemAction
+    
+    class WoZDialog(TypedDict):
+        dialogue_idx: int
+        dialogue: list[WoZTurn]
+
+logger = logging.getLogger(__name__)
+
+# Domain of WoZ dataset
+WOZ_DOMAIN = "restaurant"
+
+# Text replacement patterns
+WOZ_PATTERNS: list[tuple[str, str]] = [
+    # Center
+    ("centre", "center"),
+    # Corsican
+    ("corsican", "corsica"),
+    # Don't care (special handling)
+    ("dontcare", "@notcare")
+]
+
+def normalize_text(text: str) -> str:
+    # Convert text to lower case
+    text = text.lower()
+
+    # Apply text replacement patterns
+    for old_pattern, new_pattern in WOZ_PATTERNS:
+        text = text.replace(old_pattern, new_pattern)
+    
+    # Remove consecutive spaces
+    text = " ".join(text.split())
+    
+    return text
+
+def make_user_action_spans(user_input: str, turn_label: WoZTurnLabel) -> tuple[TODAction, TODSpans]:
+    domain_action: TODDomainAction = {}
+    domain_spans: TODDomainSpans = {}
+
+    for turn_label_item in turn_label:
+        raw_slot_name, raw_slot_value = turn_label_item
+
+        # Requesting slots
+        if raw_slot_name=="request":
+            slots = domain_action.setdefault("request", {})
+            slots[raw_slot_value] = ["@none"]
+        # Informing slots
+        else:
+            slot_value = normalize_text(raw_slot_value)
+
+            # Add slot to action
+            slots = domain_action.setdefault("inform", {})
+            slot_values = slots.setdefault(raw_slot_name, [])
+            slot_values.append(slot_value)
+
+            # Resolve and save slot value span
+            if slot_value!="@notcare":
+                try:
+                    span_start = user_input.index(slot_value)
+                    span_end = span_start+len(slot_value)
+
+                    slot_spans = domain_spans.setdefault(raw_slot_name, [])
+                    slot_spans.append((slot_value, span_start, span_end))
+                except ValueError:
+                    pass
+    
+    action = {WOZ_DOMAIN: domain_action} if domain_action else {}
+    spans = {WOZ_DOMAIN: domain_spans} if domain_spans else {}
+
+    return action, spans
+
+def convert_state(raw_state: WoZBeliefState) -> TODState:
+    domain_state: TODDomainState = {}
+
+    for raw_state_item in raw_state:
+        if raw_state_item["act"]=="inform":
+            slot_name, slot_value = raw_state_item["slots"][0]
+            domain_state[slot_name] = normalize_text(slot_value)
+    
+    return {WOZ_DOMAIN: domain_state} if domain_state else {}
+
+WOZ_DUMMY_SYS_RESP = "bye."
+
+def convert_woz_dialog(raw_dialog: WoZDialog, dataset_name: str) -> TODDialog:
+    turns = raw_dialog["dialogue"]
+    rounds: list[TODRound] = []
+
+    for i in range(len(turns)):
+        # User turn
+        user_turn = turns[i]
+
+        # User input
+        user_input = normalize_text(user_turn["transcript"])
+        # User action and spans
+        user_action, user_spans = make_user_action_spans(user_input, user_turn["turn_label"])
+        # Dialog state
+        state = convert_state(user_turn["belief_state"])
+
+        if i<len(turns)-1:
+            sys_turn = turns[i+1]
+
+            # System response
+            sys_resp = normalize_text(sys_turn["system_transcript"])
+        # Make dummy annotations for last turn
+        else:
+            sys_resp = WOZ_DUMMY_SYS_RESP
+
+        rounds.append({
+            "user_input": user_input,
+            "user_action": user_action,
+            "user_spans": user_spans,
+            "sys_resp": sys_resp,
+            "sys_action": {},
+            "sys_spans": {},
+            "state": state
+        })
+    
+    return {
+        "name": f"{dataset_name}/{raw_dialog['dialogue_idx']}.json",
+        "rounds": rounds
+    }
+
+WOZ_SUBSETS = (
+    ("train", "train"),
+    ("dev", "validate"),
+    ("test", "test")
+)
+
+def convert_save_woz_dialogs(woz_dir: str, output_path: str, pretty: bool, dataset_name: str):
+    # Dataset metadata
+    metadata: TODMetadata = {
+        "name": dataset_name,
+        "subsets": {subset: [] for subset, _ in WOZ_SUBSETS}
+    }
+    # JSON indentation
+    indent = 4 if pretty else None
+
+    with ZipFile(output_path, "w", ZIP_DEFLATED) as f_archive:
+        for subset, woz_subset_name in WOZ_SUBSETS:
+            logger.info(f"Loading subset '{subset}' ...")
+            # Load raw dialogs
+            raw_dialogs_path = os.path.join(woz_dir, f"woz_{woz_subset_name}_en.json")
+            raw_dialogs: list[WoZDialog] = utils.load_json(raw_dialogs_path)
+
+            subset_dialogs = metadata["subsets"][subset]
+
+            logger.info(f"Processing subset '{subset}' ...")
+            # Convert and save dialogs
+            for raw_dialog in raw_dialogs:
+                dialog = convert_woz_dialog(raw_dialog, dataset_name)
+
+                # Add dialog to subset
+                subset_dialogs.append(dialog["name"])
+                # Save dialog to archive
+                utils.save_json(dialog, dialog["name"], root=f_archive, indent=indent)
+
+        # Sort subset dialog names
+        for subset_dialogs in metadata["subsets"].values():
+            subset_dialogs.sort()
+        # Save dataset metadata
+        utils.save_json(metadata, METADATA_PATH, root=f_archive, indent=indent)
+
+WOZ_DEFAULT_NAME = "woz"
+
+def main():
+    parser = ArgumentParser()
+    # CLI arguments
+    parser.add_argument(
+        "-d", "--woz-dir", required=True, help="path to WoZ dataset directory"
+    )
+    parser.add_argument(
+        "-o", "--output", default=WOZ_DEFAULT_NAME+".zip",
+        help="path to save converted dataset archive"
+    )
+    parser.add_argument(
+        "-p", "--pretty", default=False, action="store_true",
+        help="pretty-print JSON of converted dialogs"
+    )
+    parser.add_argument(
+        "-n", "--name", default=WOZ_DEFAULT_NAME, help="name of converted dataset"
+    )
+    # Parse CLI arguments
+    args = parser.parse_args()
+
+    utils.setup_logging()
+    convert_save_woz_dialogs(args.woz_dir, args.output, args.pretty, args.name)
+
+if __name__=="__main__":
+    main()

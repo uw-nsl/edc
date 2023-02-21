@@ -1,0 +1,508 @@
+#! /usr/bin/env python3
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import logging, os, re
+from zipfile import ZipFile, ZIP_DEFLATED
+from argparse import ArgumentParser
+
+from fuzzysearch import find_near_matches
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+from edc import utils
+from edc.data import METADATA_PATH
+
+if TYPE_CHECKING:
+    from typing import TypedDict, Union, Optional
+    from collections.abc import Iterable, Iterator
+    
+    from edc.types import TODState, TODDomainState, TODSpans, TODAction, TODRound, TODDialog, TODMetadata
+
+    MWoZSlotValue = Union[str, list[str]]
+    MWoZBookedInfo = list[dict[str, MWoZSlotValue]]
+
+    class MWoZDomainState(TypedDict):
+        book: dict[str, Union[str, MWoZBookedInfo]]
+        semi: dict[str, MWoZSlotValue]
+
+    MWoZAction = dict[str, list[list[str]]]
+    MWoZState = dict[str, MWoZDomainState]
+
+    class MWoZTurn(TypedDict, total=False):
+        dialog_act: MWoZAction
+        metadata: MWoZState
+        span_info: list[list]
+        text: str
+
+    class MWoZDialog(TypedDict):
+        goal: dict
+        log: list[MWoZTurn]
+
+    class MWoZAuxData(TypedDict):
+        # Slots in the MultiWoZ dataset
+        slots: set[str]
+        # Non-opaque slotsw
+        non_opaque_slots: set[str]
+        # Slots to be ignored
+        ignored_slots: set[str]
+        # General and domain-specific aliases
+        slot_aliases: dict[str, dict[str, str]]
+
+        # Word-to-number mapping
+        word_to_num: dict[str, str]
+
+logger = logging.getLogger(__name__)
+
+# Auxiliary data for MultiWoZ dataset
+MWOZ_AUX_DATA: MWoZAuxData = utils.load_json(
+    os.path.join(os.path.dirname(__file__), "..", "misc", "mwoz-data.json")
+)
+# Convert certain auxiliary data to sets
+MWOZ_AUX_DATA["slots"] = set(MWOZ_AUX_DATA["slots"])
+MWOZ_AUX_DATA["non_opaque_slots"] = set(MWOZ_AUX_DATA["non_opaque_slots"])
+
+# Simple normalization patterns
+MWOZ_SIMPLE_PATTERNS: list[tuple[str, str]] = [
+    # Character normalizations
+    ("\t", " "),
+    ("\n", " "),
+    ("\u2018", "'"),
+    ("\u2019", "'"),
+    # Word normalizations
+    ("centre", "center"),
+    ("archaelogy", "archaeology"),
+    # Hotel stars
+    ("zero-star", "0 star"),
+    ("one-star", "1 star"),
+    ("two-star", "2 star"),
+    ("three-star", "3 star"),
+    ("four-star", "4 star"),
+    ("five-star", "5 star"),
+    # Delimit characters
+    (",", " , "),
+    ("?", " ? "),
+    ("!", " ! "),
+]
+
+def convert_12hr_to_24hr(m: re.Match) -> str:
+    hours_str, mins = m.groups()
+
+    hours = int(hours_str)
+    # Convert 12 hours time to 24 hours
+    if hours<12:
+        hours += 12
+    
+    return str(hours)+mins
+
+# Regular expression normalization patterns
+MWOZ_RX_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # Conditional delimitation
+    (re.compile(r"(\w+)\.($| )"), r"\1 .\2"),
+    # Times
+    # e.g. "2am" -> "2 am"
+    (re.compile(r"(\d{1})(a\.?m\.?|p\.?m\.?)"), r"\1 \2"),
+    # e.g. "2 am" -> "2:00 am"
+    (re.compile(r"(^| )(\d{1,2}) (a\.?m\.?|p\.?m\.?)"), r"\1\2:00 \3"),
+    # e.g. "9:15 -> 09:15"
+    (re.compile(r"(^| )(\d{1}:\d{2})"), r"\g<1>0\2"),
+    # e.g. "10:15 pm -> 22:15 pm"
+    (re.compile(r"(\d{2})(:\d{2}) ?p\.?m\.?"), convert_12hr_to_24hr),
+    # e.g. "24:12" -> "00:12"
+    (re.compile(r"(^| )24:(\d{2})"), r"\g<1>00:\2")
+]
+# Add word-to-number normalization patterns
+MWOZ_RX_PATTERNS.extend(
+    (re.compile(rf"(^| )({word[0]}|{word[0].upper()}){word[1:]}($| )"), rf"\g<1>{num}\g<3>") \
+    for word, num in MWOZ_AUX_DATA["word_to_num"].items()
+)
+
+# Exact search patterns
+MWOZ_EXACT_PATTERNS: list[re.Pattern] = [
+    # Times
+    re.compile(r"\d{2}:\d{2}")
+]
+
+def normalize_text(text: str) -> str:
+    # Convert text to lower case
+    text = text.lower()
+
+    # Simple normalization patterns
+    for old_pattern, new_pattern in MWOZ_SIMPLE_PATTERNS:
+        text = text.replace(old_pattern, new_pattern)
+    # Regular expression normalization patterns
+    for old_pattern, new_pattern in MWOZ_RX_PATTERNS:
+        text = old_pattern.sub(new_pattern, text)
+
+    # Remove consecutive spaces
+    text = " ".join(text.split())
+
+    return text
+
+def normalize_slot_name(domain: str, raw_slot_name: str) -> Optional[str]:
+    raw_slot_name = raw_slot_name.lower()
+
+    slot_aliases = MWOZ_AUX_DATA["slot_aliases"]
+    # Get canonical slot name by alias
+    slot_name = slot_aliases.get(domain, {}).get(raw_slot_name) or \
+        slot_aliases["*"].get(raw_slot_name) or \
+        raw_slot_name
+    
+    # Unknown slot
+    if slot_name not in MWOZ_AUX_DATA["slots"]:
+        return None
+    
+    return slot_name
+
+def iter_raw_domain_state(raw_domain_state: MWoZDomainState) -> Iterator[tuple[str, MWoZSlotValue]]:
+    # General information slots
+    yield from raw_domain_state["semi"].items()
+
+    # Booking-related information
+    for raw_slot_name, raw_slot_value in raw_domain_state["book"].items():
+        # Ignore booked itinerary information
+        if raw_slot_name=="booked":
+            continue
+
+        yield "book "+raw_slot_name, raw_slot_value
+
+def convert_state(raw_state: MWoZState) -> TODState:
+    state: TODState = {}
+
+    for domain, raw_domain_state in raw_state.items():
+        domain_state: TODDomainState = {}
+
+        for raw_slot_name, raw_slot_value in iter_raw_domain_state(raw_domain_state):
+            # Ignore empty string or list
+            if not raw_slot_value:
+                continue
+            # If multiple slot values are present, only use the first value
+            if isinstance(raw_slot_value, list):
+                raw_slot_value = raw_slot_value[0]
+            # Ignore certain slot values
+            if raw_slot_value in ("none", "not mentioned"):
+                continue
+            
+            # Normalize slot name
+            slot_name = raw_slot_name.lower()
+            # Normalize slot value
+            if raw_slot_value.replace(" ", "").replace("'", "")=="dontcare":
+                slot_value = "@notcare"
+            else:
+                slot_value = normalize_text(raw_slot_value)
+            # Save slot
+            domain_state[slot_name] = slot_value
+        
+        # Save domain state
+        if domain_state:
+            state[domain] = domain_state
+    
+    return state
+
+def convert_spans(text: str, raw_spans: list[list], current_domain: Optional[str], mwoz_version: str
+    ) -> TODSpans:
+    # Word and character index look-ups
+    word_indices: list[int] = []
+    char_indices: list[int] = []
+
+    word_index = 0
+    # Build look-ups
+    for i, char in enumerate(text):
+        if char==" ":
+            word_index += 1
+        else:
+            word_indices.append(word_index)
+            char_indices.append(i)
+    
+    # Canoncialize text for search
+    search_text = text.replace(" ", "")
+    # Slot values may be co-referenced
+    has_coref = "same" in search_text
+
+    spans: TODSpans = {}
+    # Convert spans
+    for domain_intent, raw_slot_name, raw_slot_value, raw_start, _ in raw_spans:
+        # e.g. "Restaurant-Inform" -> "restaurant"
+        domain: str = domain_intent.split("-")[0].lower()
+
+        # Ignore certain slot values
+        if raw_slot_value in ("", "none", "not mentioned"):
+            continue
+        # Ignore variations of "don't care"
+        if raw_slot_value.replace(" ", "").replace("'", "")=="dontcare":
+            continue
+
+        # Infer domain for booking-related slots
+        if domain=="booking":
+            # Cannot infer domain as current domain is unknown
+            if current_domain is None:
+                logger.warning(
+                    f"Ignoring booking-related slot '{raw_slot_name}' as current domain is unknown"
+                )
+                continue
+            else:
+                domain = current_domain
+        
+        # Normalize slot name
+        slot_name = normalize_slot_name(domain, raw_slot_name)
+        if slot_name is None:
+            continue
+        # Non-opaque slot does not need span extraction
+        if slot_name in MWOZ_AUX_DATA["non_opaque_slots"]:
+            continue
+        
+        # Normalize and canonicalize slot value
+        slot_value = normalize_text(raw_slot_value)
+        search_value = slot_value.replace(" ", "")
+        # Search span value in original text
+        search_exact = any(pattern.match(search_value) for pattern in MWOZ_EXACT_PATTERNS)
+        max_l_dist = 0 if search_exact else int(0.2*len(search_value))
+        matches = find_near_matches(search_value, search_text, max_l_dist=max_l_dist)
+        # Skip span if no occurrence is found
+        if not matches:
+            # Potential co-referencing
+            if has_coref:
+                logger.debug(
+                    f"Skip span for slot '{slot_name}' in domaion '{domain}' for "
+                    "potential co-referencing"
+                )
+            # Other reasons
+            else:
+                logger.warning(
+                    f"Skip span for slot '{slot_name}' in domain '{domain}' as its value "
+                    f"'{raw_slot_value}' cannot be found in text '{text}'"
+                )
+            continue
+        
+        # Find the "most likely" span location
+        preferred_indices = char_indices if mwoz_version=="2.2" else word_indices
+        preferred_match = min(
+            matches, key=lambda m: (m.dist, abs(preferred_indices[m.start]-raw_start))
+        )
+        # Look up for starting and ending position of original text
+        span_start = char_indices[preferred_match.start]
+        span_end = char_indices[preferred_match.end-1]+1
+        # Span is fuzzy matched
+        if preferred_match.dist>0:
+            logger.debug(
+                f"Span for slot '{slot_name}' in domain '{domain}' is fuzzy matched: "
+                f"'{text[span_start:span_end]}' matched for '{raw_slot_value}' in text '{text}'"
+            )
+        
+        # Save span
+        slot_spans = spans.setdefault(domain, {}).setdefault(slot_name, [])
+        slot_spans.append((slot_value, span_start, span_end))
+    
+    return spans
+
+def convert_action(raw_action: MWoZAction, current_domain: Optional[str]) -> TODAction:
+    action: TODAction = {}
+
+    for domain_intent, raw_slots in raw_action.items():
+        domain, intent = domain_intent.lower().split("-")
+
+        # Special handling for "general" pseudo-domain
+        if domain=="general":
+            domain_action = action.setdefault("@general", {})
+            domain_action[intent] = {"@none": "@none"}
+            continue
+
+        # Infer domain for booking-related slots
+        if domain=="booking":
+            if current_domain is None:
+                logger.warning(
+                    f"Skipping booking-related intent '{intent}' as current domain is unknown"
+                )
+                continue
+            else:
+                domain = current_domain
+
+        for raw_slot_name, raw_slot_value in raw_slots:
+            # Normalize slot name
+            if raw_slot_name=="none":
+                slot_name = "@none"
+            else:
+                slot_name = normalize_slot_name(domain, raw_slot_name)
+                if slot_name is None:
+                    continue
+            # Normalize slot value
+            if intent=="request" or raw_slot_value=="none":
+                slot_value = "@none"
+            elif raw_slot_value.replace(" ", "").replace("'", "")=="dontcare":
+                slot_value = "@notcare"
+            else:
+                slot_value = normalize_text(raw_slot_value)
+
+            slots = action.setdefault(domain, {}).setdefault(intent, {})
+            slots.setdefault(slot_name, []).append(slot_value)
+    
+    return action
+
+def convert_mwoz_dialog(raw_dialog: MWoZDialog, mwoz_version: str, exclude_domains: list[str],
+    dataset_name: str, dialog_name: str) -> TODDialog:
+    # Dialog rounds and previous state
+    rounds: list[TODRound] = []
+    prev_state: TODState = {}
+
+    turn_iter = iter(raw_dialog["log"])
+    current_domain: Optional[str] = None
+    
+    while True:
+        try:
+            user_turn = next(turn_iter)
+            sys_turn = next(turn_iter)
+        except StopIteration:
+            break
+
+        # Convert dialog state
+        state = convert_state(sys_turn["metadata"])
+        # Excluded domain found; ignore dialog
+        for domain in exclude_domains:
+            if domain in state:
+                return {}
+        # Update current domain
+        for domain in state.keys():
+            if domain not in prev_state:
+                current_domain = domain
+        
+        # User input
+        user_input = normalize_text(user_turn["text"])
+        # Convert user spans
+        user_spans = convert_spans(
+            user_input, user_turn.get("span_info", {}), current_domain, mwoz_version
+        )
+        # Convert user action
+        user_action = convert_action(user_turn.get("dialog_act", {}), current_domain)
+        
+        # System response
+        sys_resp = normalize_text(sys_turn["text"])
+        # Convert system spans
+        sys_spans = convert_spans(
+            sys_resp, sys_turn.get("span_info", {}), current_domain, mwoz_version
+        )
+        # Convert system action
+        sys_action = convert_action(sys_turn.get("dialog_act", {}), current_domain)
+
+        # Store current round
+        rounds.append({
+            "user_input": user_input,
+            "user_action": user_action,
+            "user_spans": user_spans,
+            "sys_resp": sys_resp,
+            "sys_action": sys_action,
+            "sys_spans": sys_spans,
+            "state": state
+        })
+
+    return {
+        "name": dataset_name+"/"+dialog_name,
+        "rounds": rounds
+    }
+
+MWOZ_SUBSETS = ("train", "dev", "test")
+
+def convert_save_mwoz_dialogs(mwoz_archive_path: str, output_path: str, mwoz_version: str,
+    exclude_domains: list[str], pretty: bool, dataset_name: str):
+    with ZipFile(mwoz_archive_path, "r") as f_archive_in:
+        # Load validation set dialogs
+        logger.info("Loading list of validation dialogs ...")
+        dev_dialogs_path = utils.glob("*/valListFile.*", root=f_archive_in)[0]
+        dev_dialogs = set(utils.read_lines(dev_dialogs_path, root=f_archive_in))
+        # Load test set dialogs
+        logger.info("Loading list of test dialogs ...")
+        test_dialogs_path = utils.glob("*/testListFile.*", root=f_archive_in)[0]
+        test_dialogs = set(utils.read_lines(test_dialogs_path, root=f_archive_in))
+
+        # Load all raw dialogs
+        logger.info("Loading all dialogs ...")
+        raw_dialogs_path = utils.glob("*/data.json", root=f_archive_in)[0]
+        raw_dialogs: dict[str, MWoZDialog] = utils.load_json(raw_dialogs_path, root=f_archive_in)
+    
+    # Dataset metadata
+    metadata: TODMetadata = {
+        "name": dataset_name,
+        "subsets": {subset: [] for subset in MWOZ_SUBSETS}
+    }
+    # JSON indentation
+    indent = 4 if pretty else None
+    
+    with ZipFile(output_path, "w", ZIP_DEFLATED) as f_archive_out:
+        for dialog_name, raw_dialog in tqdm(raw_dialogs.items()):
+            # Convert MultiWoZ dialog
+            dialog = convert_mwoz_dialog(
+                raw_dialog, mwoz_version, exclude_domains, dataset_name, dialog_name
+            )
+            if not dialog:
+                continue
+
+            # Validation set
+            if dialog_name in dev_dialogs:
+                subset_dialogs = metadata["subsets"]["dev"]
+            # Test set
+            elif dialog_name in test_dialogs:
+                subset_dialogs = metadata["subsets"]["test"]
+            # Training set
+            else:
+                subset_dialogs = metadata["subsets"]["train"]
+            # Add dialog to corresponding subset
+            subset_dialogs.append(dialog["name"])
+            
+            # Save dialog to archive
+            utils.save_json(dialog, dialog["name"], root=f_archive_out, indent=indent)
+        
+        # Sort subset dialog names
+        for subset_dialogs in metadata["subsets"].values():
+            subset_dialogs.sort()
+        # Save dataset metadata
+        utils.save_json(metadata, METADATA_PATH, root=f_archive_out, indent=indent)
+
+MWOZ_DEFAULT_NAME_TMPL = "mwoz{}"
+
+def main():
+    parser = ArgumentParser()
+    # CLI arguments
+    parser.add_argument(
+        "-i", "--mwoz-archive-path", required=True, help="path to the MultiWoZ dataset archive"
+    )
+    parser.add_argument(
+        "-o", "--output", help="path to save converted dataset archive"
+    )
+    parser.add_argument(
+        "-e", "--exclude-domain", action="append",
+        help="domain(s) to be excluded during dataset pre-processing"
+    )
+    parser.add_argument(
+        "-v", "--mwoz-version", default="2.1", choices=["2.1", "2.2"],
+        help="version of the MultiWoZ dataset"
+    )
+    parser.add_argument(
+        "-p", "--pretty", default=False, action="store_true",
+        help="pretty-print JSON of converted dialogs"
+    )
+    parser.add_argument(
+        "-n", "--name", help="name of converted dataset"
+    )
+    parser.add_argument(
+        "-l", "--logging-level", default="INFO", help="verbosity level of logging"
+    )
+    # Parse arguments
+    args = parser.parse_args()
+
+    # Excluded domains
+    exclude_domains = args.exclude_domain or ()
+    # Dataset name and output path
+    dataset_name = args.name or MWOZ_DEFAULT_NAME_TMPL.format(args.mwoz_version)
+    output_path = args.output or dataset_name+".zip"
+    
+    # Set up logging
+    utils.setup_logging(level=args.logging_level)
+
+    with logging_redirect_tqdm():
+        convert_save_mwoz_dialogs(
+            args.mwoz_archive_path, output_path, args.mwoz_version,
+            exclude_domains, args.pretty, dataset_name
+        )
+
+if __name__=="__main__":
+    main()

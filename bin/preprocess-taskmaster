@@ -1,0 +1,422 @@
+#! /usr/bin/env python3
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import logging, os, csv, glob, copy
+from random import Random
+from argparse import ArgumentParser
+from zipfile import ZipFile
+
+from hgst import utils
+from hgst.data import METADATA_PATH, io
+
+if TYPE_CHECKING:
+    from typing import TypedDict, Optional
+
+    from edc.types import TODRound, TODState, TODSpans
+
+    class TMAnnotation(TypedDict):
+        name: str
+
+    class TMSegment(TypedDict):
+        start_index: int
+        end_index: int
+        text: str
+        annotations: list[TMAnnotation]
+
+    class TMTurn(TypedDict, total=False):
+        index: int
+        speaker: str
+        text: str
+        segments: list[TMSegment]
+
+    class TMDialog(TypedDict, total=False):
+        conversation_id: str
+        utterances: list[TMTurn]
+    
+    TVTSamples = dict[str, set[str]]
+
+logger = logging.getLogger(__name__)
+
+TM_CHAR_NORM_MAP = {
+    # Quote
+    "\u00a8": "'",
+    "\u00b4": "'",
+    "\u2018": "'",
+    "\u2019": "'",
+    # Ignored characters (treated as space)
+    "\n": " ",
+    "\r": " ",
+    "\u00a0": " ",
+    "\u200b": " ",
+    "\u200e": " ",
+    "\u2026": " ",
+    "\u2122": " "
+}
+
+def normalize_text(text: str) -> tuple[str, list[int]]:
+    # Normalized characters
+    normalized_chars: list[str] = []
+    prev_char = ""
+    # Normalized character index mapping
+    char_indices: list[int] = []
+
+    for char in text:
+        # Normalize character
+        char = TM_CHAR_NORM_MAP.get(char, char)
+
+        # Append normalized character index
+        char_idx = len(normalized_chars)
+        if char==" " and prev_char==" ":
+            char_idx -= 1
+        char_indices.append(char_idx)
+
+        # Append character if ...
+        # 1) it is not space character
+        # 2) it is space character and after another non-space character
+        if char!=" " or (char==" " and normalized_chars and normalized_chars[-1]!=" "):
+            normalized_chars.append(char)
+            prev_char = char
+    
+    # Index for end position
+    char_indices.append(len(normalized_chars))
+    # Remove trailing space character
+    if normalized_chars and normalized_chars[-1]==" ":
+        normalized_chars.pop()
+    
+    return "".join(normalized_chars), char_indices
+
+def process_segment(spans: TODSpans, segment: TMSegment, char_indices: list[int],
+    pos_offset: int, subset: str, preserve_case: bool, state: Optional[TODState] = None):
+    # Segment annotation
+    raw_annotation = segment.get("annotations")
+    if not raw_annotation:
+        return
+    annotation = raw_annotation[0]["name"]
+    
+    # Obtain domain and raw slot name
+    if subset=="TM-3-2020":
+        domain = "movie"
+        raw_slot_name = annotation
+    else:
+        domain, raw_slot_name = annotation.split(".", 1)
+        domain = domain.replace("_", " ")
+        # Strip task name for TM-2
+        if subset=="TM-2-2020":
+            domain = domain.split(" ")[0]
+            if domain[-1].isdigit():
+                domain = domain[:-1]
+    
+    # Strip ".accept" and ".reject" suffix
+    if raw_slot_name.endswith(".accept") or raw_slot_name.endswith(".reject"):
+        raw_slot_name = raw_slot_name.rsplit(".", 1)[0]
+    # Unify word separators
+    raw_slot_name = raw_slot_name.replace("_", " ").replace("-", " ")
+    
+    split_names = raw_slot_name.split(".")
+    # Convert slot name from parts
+    if len(split_names)==1:
+        # Music description slots (TM-2)
+        if subset=="TM-2-2020" and domain=="music" and split_names[0].startswith("describes "):
+            slot_name = split_names[0][10:]+" description"
+        # Other slots
+        else:
+            slot_name = split_names[0]
+    elif len(split_names)==2:
+        name_0, name_1 = split_names
+        # Amount slot
+        if name_0=="num":
+            slot_name = "number of "+name_1
+        # Appointment slot (TM-1)
+        elif subset=="TM-1-2019" and name_1=="appt":
+            slot_name = "appointment "+name_0
+        # Flights slots: do not exchange order (TM-2)
+        elif subset=="TM-2-2020" and domain=="flight":
+            slot_name = name_0+" "+name_1
+        # Other slots
+        else:
+            slot_name = name_1+" "+name_0
+    else:
+        logger.warning(f"Cannot parse annotation '{annotation}'; ignoring slot ...")
+        return
+
+    # Get and adjust span positions
+    span_start = char_indices[segment["start_index"]]+pos_offset
+    span_end = char_indices[segment["end_index"]]+pos_offset
+    # Save slot span
+    spans.append((domain, slot_name, span_start, span_end))
+
+    # Update dialog state
+    if state is not None:
+        domain_state = state.setdefault(domain, {})
+        # Convert slot value to lower case
+        slot_value = segment["text"]
+        if not preserve_case:
+            slot_value = slot_value.lower()
+        # Update domain state
+        domain_state[slot_name] = slot_value
+
+def convert_tm_dialog(raw_dialog: TMDialog, subset: str, all_domains: set[str], all_slots: set[str],
+    preserve_case: bool) -> list[TODRound]:
+    rounds: list[TODRound] = []
+    state: TODState = {}
+
+    raw_turns = raw_dialog["utterances"]
+    if not raw_turns:
+        return []
+    # Iterator to raw turns
+    turn_iter = iter(raw_turns)
+    turn = next(turn_iter)
+
+    while True:
+        user_utterances: list[str] = []
+        user_offset = 0
+        user_spans: TODSpans = []
+
+        try:
+            # Advance until user turns
+            while turn["speaker"].lower()!="user":
+                turn = next(turn_iter)
+            # Process consecutive user turns
+            while turn["speaker"].lower()=="user":
+                utterance, char_indices = normalize_text(turn["text"])
+
+                # Save user utterance
+                user_utterances.append(utterance)
+                # Collect user spans and update dialog state
+                for segment in turn.get("segments", []):
+                    process_segment(
+                        user_spans, segment, char_indices, user_offset, subset, preserve_case, state
+                    )
+                
+                # Update span position offset
+                user_offset += len(utterance)+1
+                # Get next turn
+                turn = next(turn_iter)
+        except StopIteration:
+            break
+        
+        sys_utterances: list[str] = []
+        sys_offset = 0
+        sys_spans: TODSpans = []
+
+        try:
+            # Advance until system turns
+            while turn["speaker"].lower()!="assistant":
+                turn = next(turn_iter)
+            # Process consecutive system turns
+            while turn["speaker"].lower()=="assistant":
+                utterance, char_indices = normalize_text(turn["text"])
+
+                # Save system utterance
+                sys_utterances.append(utterance)
+                # Collect user spans and update dialog state
+                for segment in turn.get("segments", []):
+                    process_segment(
+                        sys_spans, segment, char_indices, sys_offset, subset, preserve_case
+                    )
+                
+                # Update span position offset
+                sys_offset += len(utterance)+1
+                # Get next turn
+                turn = next(turn_iter)
+        except StopIteration:
+            break
+        
+        # Concatenate user and system utterances
+        user_utterance = " ".join(user_utterances)
+        sys_utterance = " ".join(sys_utterances)
+        # Convert utterances to lower case
+        if not preserve_case:
+            user_utterance = user_utterance.lower()
+            sys_utterance = sys_utterance.lower()
+
+        # Update all occurred domains and slots
+        all_domains.update(state.keys())
+        all_slots.update(
+            slot_name for domain_slots in state.values() \
+            for slot_name in domain_slots.keys()
+        )
+
+        # Store current round
+        rounds.append({
+            "user": user_utterance,
+            "user_spans": user_spans,
+            "sys": sys_utterance,
+            "sys_spans": sys_spans,
+            "offers": [],
+            "state": copy.deepcopy(state)
+        })
+    
+    return rounds
+
+TVT = ["train", "dev", "test"]
+
+def load_tm_subset_data(dataset_root: str, subset: str, tm2_tvt_seed: int = 1145141919810,
+    tm2_tvt_split: tuple[float, float] = (0.6, 0.2)) -> tuple[list[TMDialog], TVTSamples]:
+    subset_root = os.path.join(dataset_root, subset)
+    tvt_sets: TVTSamples = {}
+
+    # TM-1
+    if subset=="TM-1-2019":
+        # Load dialogs
+        self_dialogs: list[TMDialog] = io.load_json(
+            os.path.join(subset_root, "self-dialogs.json")
+        )
+        woz_dialogs: list[TMDialog] = io.load_json(
+            os.path.join(subset_root, "woz-dialogs.json")
+        )
+        # Combine self and WoZ dialogs
+        dialogs = self_dialogs+woz_dialogs
+
+        for tvt in TVT:
+            # Load dialogs list from CSV files
+            tvt_reader = csv.reader(io.read_lines(
+                os.path.join(subset_root, "train-dev-test", tvt+".csv")
+            ))
+            tvt_sets[tvt] = set(line[0] for line in tvt_reader)
+    # TM-2
+    elif subset=="TM-2-2020":
+        # Get dialogs paths
+        dialogs_paths = sorted(glob.glob(os.path.join(subset_root, "data", "*.json")))
+        # Load dialogs from all files
+        dialogs: list[TMDialog] = []
+        for dialogs_path in dialogs_paths:
+            dialogs += io.load_json(dialogs_path)
+        
+        # Compute training and validation size
+        train_size = round(len(dialogs)*tm2_tvt_split[0])
+        dev_size = round(len(dialogs)*tm2_tvt_split[1])
+        # Random shuffle dialog names
+        dialog_names = [dialog["conversation_id"] for dialog in dialogs]
+        Random(tm2_tvt_seed).shuffle(dialog_names)
+        # Build dialogs lists
+        tvt_sets["train"] = set(dialog_names[:train_size])
+        tvt_sets["dev"] = set(dialog_names[-dev_size:])
+        tvt_sets["test"] = set(dialog_names[train_size:-dev_size])
+    # TM-3
+    elif subset=="TM-3-2020":
+        # Get dialogs paths
+        dialogs_paths = sorted(glob.glob(os.path.join(subset_root, "data", "*.json")))
+        # Load dialogs from all files
+        dialogs: list[TMDialog] = []
+        for dialogs_path in dialogs_paths:
+            dialogs += io.load_json(dialogs_path)
+
+        for tvt in TVT:
+            # Get TVT split files paths
+            tvt_paths = sorted(glob.glob(os.path.join(subset_root, "splits", tvt, "*.tsv")))
+            # Load dialogs list from CSV files
+            tvt_set = tvt_sets[tvt] = set()
+            for tvt_path in tvt_paths:
+                tvt_reader = csv.reader(io.read_lines(tvt_path), delimiter="\t")
+                tvt_set.update(line[2] for line in tvt_reader)
+    # Unknown subset
+    else:
+        raise ValueError(f"unknown TaskMaster subset: '{subset}'")
+    
+    return dialogs, tvt_sets
+
+def convert_save_tm_dialogs(f_archive: ZipFile, dataset_root: str, subsets: list[str], pretty: bool,
+    preserve_case: bool, dataset_name: str = "taskmaster", progress_interval: int = 500):
+    json_indent = 4 if pretty else None
+
+    # All occurred domains and slots
+    all_domains: dict[str, set[str]] = {tvt: set() for tvt in TVT}
+    all_slots: dict[str, set[str]] = {tvt: set() for tvt in TVT}
+    samples: dict[str, set[str]] = {tvt: set() for tvt in TVT}
+
+    for subset in subsets:
+        # Load data for subset
+        logger.info(f"Loading dialogs for subset {subset} ...")
+        raw_dialogs, subset_samples = load_tm_subset_data(dataset_root, subset)
+
+        logger.info(f"Converting dialogs for subset {subset} ...")
+        for i, raw_dialog in enumerate(raw_dialogs):
+            dialog_id = raw_dialog["conversation_id"]
+            # Training set
+            if dialog_id in subset_samples["train"]:
+                tvt = "train"
+            # Validation set
+            elif dialog_id in subset_samples["dev"]:
+                tvt = "dev"
+            # Test set
+            else:
+                tvt = "test"
+
+            # Name of converted dialog
+            dialog_name = f"{subset}/{dialog_id}.json"
+            # Skip dialog if already exists
+            if dialog_name in samples[tvt]:
+                continue
+
+            # Convert dialog
+            dialog_rounds = convert_tm_dialog(
+                raw_dialog, subset, all_domains[tvt], all_slots[tvt], preserve_case
+            )
+            if not dialog_rounds:
+                continue
+
+            # Add dialog to corresponding set
+            samples[tvt].add(dialog_name)
+            # Save converted dialog
+            dialog_path = f"{dataset_name}/{tvt}/{dialog_name}"
+            io.dump_json(dialog_path, {
+                "name": dialog_name,
+                "rounds": dialog_rounds
+            }, f_archive, indent=json_indent)
+
+            # Report progress
+            if (i+1)%progress_interval==0:
+                logger.info(f"{i+1}/{len(raw_dialogs)} dialogs converted ...")
+    
+    for tvt in TVT:
+        metadata_path = os.path.join(f"{dataset_name}/{tvt}/{METADATA_PATH}")
+        # Write metadata
+        io.dump_json(metadata_path, {
+            "domains": sorted(all_domains[tvt]),
+            "slots": sorted(all_slots[tvt]),
+            "samples": sorted(samples[tvt])
+        }, archive=f_archive, indent=json_indent)
+
+TASKMASTER_SUBSETS = {
+    "tm1": ["TM-1-2019"],
+    "tm2": ["TM-2-2020"],
+    "tm3": ["TM-3-2020"],
+    "all": ["TM-1-2019", "TM-2-2020", "TM-3-2020"]
+}
+
+def main():
+    parser = ArgumentParser()
+    # CLI arguments
+    parser.add_argument(
+        "-d", "--dataset-repo", required=True, help="path to the TaskMaster repository"
+    )
+    parser.add_argument(
+        "-s", "--subsets", default="all", choices=list(TASKMASTER_SUBSETS.keys()),
+        help="subsets to be included during conversion"
+    )
+    parser.add_argument(
+        "-p", "--pretty", default=False, action="store_true",
+        help="pretty-print JSON of converted dialogs"
+    )
+    parser.add_argument(
+        "-c", "--preserve-case", default=False, action="store_true", help="preserve case in outputs"
+    )
+    parser.add_argument(
+        "-o", "--output", required=True, help="path to save archive of converted dialogs"
+    )
+    # Parse CLI arguments
+    args = parser.parse_args()
+
+    utils.setup_logging()
+
+    # Obtain subset to be converted
+    subsets = TASKMASTER_SUBSETS[args.subsets]
+    # Convert and save dialogs
+    with io.new_zip_archive(args.output) as f_archive:
+        convert_save_tm_dialogs(f_archive, args.dataset_repo, subsets, args.pretty, args.preserve_case)
+
+if __name__=="__main__":
+    main()

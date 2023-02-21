@@ -1,0 +1,42 @@
+#! /bin/sh
+
+# Commands directory
+bin_dir="$(dirname $0)"
+# MultiWoZ 2.2 dataset
+mwoz22_path="${bin_dir}/../data/mwoz2.2.zip"
+
+predict_eval_edc() {
+    setting="$1"
+    shift
+
+    for version in 0 1 2; do
+        echo ">> Evaluating ablation experiment with setting '${setting}' (version ${version}) ..."
+        echo
+
+        # Create prediction directory
+        pred_dir="${bin_dir}/../preds/ablation/${setting}"
+        mkdir -p "${pred_dir}"
+        # Run prediction
+        "${bin_dir}/predict-edc" -n "ablation/${setting}/version_${version}" \
+            -d "${mwoz22_path}" -o "${pred_dir}/${version}.zip" "$@"
+        # Evaluate prediction
+        "${bin_dir}/eval-edc" -d "${mwoz22_path}" -p "${pred_dir}/${version}.zip" -s test
+    done
+}
+
+# Full
+predict_eval_edc full
+
+# Without user action
+predict_eval_edc no-ua
+# Without system action
+predict_eval_edc no-sa
+# Without user and system action
+predict_eval_edc no-ua-sa
+
+# One-pass prediction
+predict_eval_edc one-pass --one-pass
+# Standalone context encoding
+predict_eval_edc sa-ctx --standalone-ctx
+# One-pass prediction with standalone context encoding
+predict_eval_edc one-pass-sa-ctx --one-pass --standalone-ctx

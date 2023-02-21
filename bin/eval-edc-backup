@@ -1,0 +1,108 @@
+#! /usr/bin/env python3
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from collections import Counter
+from zipfile import ZipFile
+from argparse import ArgumentParser
+import random
+
+import numpy as np
+
+from edc import utils
+from edc.data import METADATA_PATH, compute_action_metrics, state_matches
+
+def evaluate_edc(dataset_path: str, pred_path: str, subset: str):
+    # Action metrics
+    user_action_metrics: list[np.ndarray] = []
+    sys_action_metrics: list[np.ndarray] = []
+    # State metrics
+    n_rounds = 0
+    n_correct_states = 0
+
+    w = []
+
+    # Load predictions
+    all_preds = utils.load_json(pred_path)
+
+    with ZipFile(dataset_path) as f_archive:
+        metadata = utils.load_json(METADATA_PATH, root=f_archive)
+        for i, dialog_path in enumerate(metadata["subsets"][subset]):
+            dialog = utils.load_json(dialog_path, root=f_archive)
+            preds = all_preds[i]
+
+            history = []
+
+            for j, (round, pred) in enumerate(zip(dialog["rounds"], preds)):
+                history.append(round["user_input"])
+                history.append(round["sys_resp"])
+
+                user_action_metrics.append(
+                    compute_action_metrics(round, pred, "user")
+                )
+                sys_action_metrics.append(
+                    compute_action_metrics(round, pred, "sys")
+                )
+
+                matches = state_matches(round["state"], pred.get("dialog_state", {}), set())
+                n_rounds += 1
+                if matches:
+                    n_correct_states += 1
+                else:
+                    w.append((
+                        round["state"], pred.get("dialog_state", {}), history.copy(), j, len(dialog["rounds"]),
+                        round["user_action"], pred.get("user_action")
+                    ))
+    
+    user_action_metrics = np.stack(user_action_metrics).mean(0)
+    sys_action_metrics = np.stack(sys_action_metrics).mean(0)
+    
+    print("User action:")
+    print(user_action_metrics, "\n")
+
+    print("System action:")
+    print(sys_action_metrics, "\n")
+
+    print("JGA:")
+    print(n_correct_states/n_rounds, "\n")
+
+    print("Wrong predictions:")
+    random.shuffle(w)
+    for _, ww in zip(range(5), w):
+        print(ww[3], "/", ww[4])
+        print()
+        print("  History:")
+        for utterance in ww[2]:
+            print("  > "+utterance)
+        print()
+        print("  Actual:", ww[0])
+        print("  Prediction:", ww[1])
+        print()
+        print("  Actual user action:", ww[5])
+        print("  Predicted user action:", ww[6], "\n")
+        print("==========================\n")
+
+def main():
+    # CLI arguments parser
+    parser = ArgumentParser(description="evaluate dialog state predictions")
+    # Add CLI arguments
+    parser.add_argument(
+        "-d", "--dataset", required=True, help="path to TOD dataset archive"
+    )
+    parser.add_argument(
+        "-p", "--prediction", required=True,
+        help="path to dialog state prediction archive"
+    )
+    parser.add_argument(
+        "-s", "--subset", default="dev", choices=["train", "dev", "test"],
+        help="subset of given datasets for prediction"
+    )
+    # Parse CLI arguments
+    args = parser.parse_args()
+
+    evaluate_edc(args.dataset, args.prediction, args.subset)
+
+if __name__=="__main__":
+    main()

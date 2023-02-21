@@ -1,0 +1,274 @@
+#! /usr/bin/env python3
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import copy, os, glob, logging, multiprocessing as mp
+from functools import partial
+from zipfile import ZipFile, ZIP_DEFLATED
+from argparse import ArgumentParser
+
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+from edc import utils
+from edc.data import METADATA_PATH
+
+if TYPE_CHECKING:
+    from typing import TypedDict
+    from collections.abc import Iterator
+
+    from edc.types import TODAction, TODSpans, TODState, TODRound, TODDialog, TODMetadata
+
+    class SGDAction(TypedDict):
+        act: str
+        canonical_values: list[str]
+        slot: str
+        values: list[str]
+
+    class SGDSlot(TypedDict):
+        slot: str
+        start: int
+        exclusive_end: int
+
+    class SGDState(TypedDict):
+        active_intent: str
+        requested_slots: list[str]
+        slot_values: dict[str, list[str]]
+
+    class SGDFrame(TypedDict):
+        actions: list[SGDAction]
+        service: str
+        slots: list[SGDSlot]
+        state: SGDState
+
+    class SGDTurn(TypedDict):
+        frames: list[SGDFrame]
+        speaker: str
+        utterance: str
+
+    class SGDDialog(TypedDict):
+        dialogue_id: str
+        turns: list[SGDTurn]
+
+logger = logging.getLogger(__name__)
+
+def normalize_domain(raw_domain: str) -> str:
+    # e.g. "Restaurant_1" -> "restaurant"
+    return raw_domain.split("_")[0].lower()
+
+def normalize_intent_slot_name(text: str) -> str:
+    return " ".join(text.lower().split("_"))
+
+def normalize_slot_value(text: str) -> str:
+    text = text.lower()
+
+    # Special handling for "don't care"
+    if text=="dontcare":
+        text = "@notcare"
+    
+    return text
+
+def update_state(state: TODState, raw_slots: dict[str, list[str]], domain: str):
+    if not raw_slots:
+        return
+
+    domain_state = state.setdefault(domain, {})
+
+    for raw_slot_name, raw_slot_values in raw_slots.items():
+        slot_name = normalize_intent_slot_name(raw_slot_name)
+
+        if not raw_slot_values:
+            continue
+        # Only use last slot value
+        domain_state[slot_name] = normalize_slot_value(raw_slot_values[0])
+
+def update_spans(spans: TODSpans, raw_slots: list[SGDSlot], domain: str):
+    if not raw_slots:
+        return
+
+    domain_spans = spans.setdefault(domain, {})
+
+    for raw_slot in raw_slots:
+        slot_name = normalize_intent_slot_name(raw_slot["slot"])
+        slot_spans = domain_spans.setdefault(slot_name, [])
+
+        slot_spans.append((raw_slot["start"], raw_slot["exclusive_end"]))
+
+def update_action(action: TODAction, raw_actions: list[SGDAction], domain: str):
+    if not raw_actions:
+        return
+
+    domain_action = action.setdefault(domain, {})
+
+    for raw_action in raw_actions:
+        intent = normalize_intent_slot_name(raw_action["act"])
+        slot_name = normalize_intent_slot_name(raw_action["slot"]) or "@none"
+
+        raw_slot_values = raw_action["values"]
+        if raw_slot_values:
+            slot_values = [normalize_slot_value(value) for value in raw_slot_values]
+        else:
+            slot_values = ["@none"]
+        
+        slots = domain_action.setdefault(intent, {})
+        slots[slot_name] = slot_values
+
+def zip_turns(raw_turns: list[SGDTurn]) -> Iterator[tuple[SGDTurn, SGDTurn]]:
+    turn_iter = iter(raw_turns)
+
+    try:
+        while True:
+            # Find next user turn
+            user_turn = next(turn_iter)
+            while user_turn["speaker"]!="USER":
+                user_turn = next(turn_iter)
+            # Find next system turn
+            system_turn = next(turn_iter)
+            while system_turn["speaker"]!="SYSTEM":
+                system_turn = next(turn_iter)
+            
+            yield user_turn, system_turn
+    except StopIteration:
+        return
+
+SGD_DISCARD_PATTERNS = ("  ", "\n")
+
+def convert_sgd_dialog(dataset_name: str, subset: str, raw_dialog: SGDDialog) -> TODDialog:
+    rounds: list[TODRound] = []
+    state: TODState = {}
+
+    for user_turn, system_turn in zip_turns(raw_dialog["turns"]):
+        user_input = user_turn["utterance"].rstrip().lower()
+        sys_resp = system_turn["utterance"].rstrip().lower()
+
+        # Discard dialog if utterance contains certain patterns
+        for utterance in (user_input, sys_resp):
+            for pattern in SGD_DISCARD_PATTERNS:
+                if pattern in utterance:
+                    return {}
+
+        user_action: TODAction = {}
+        user_spans: TODSpans = {}
+
+        # Process frames in user turn
+        for frame in user_turn["frames"]:
+            domain = normalize_domain(frame["service"])
+
+            # Update dialog state
+            update_state(state, frame["state"]["slot_values"], domain)
+            # Update user action
+            update_action(user_action, frame["actions"], domain)
+            # Update user spans
+            update_spans(user_spans, frame["slots"], domain)
+
+        sys_action: TODAction = {}
+        sys_spans: TODSpans = {}
+
+        # Process frames in system turn
+        for frame in system_turn["frames"]:
+            domain = normalize_domain(frame["service"])
+
+            # Update system action
+            update_action(sys_action, frame["actions"], domain)
+            # Update system spans
+            update_spans(sys_spans, frame["slots"], domain)
+
+        # Store current round
+        rounds.append({
+            "user_input": user_input,
+            "user_action": user_action,
+            "user_spans": user_spans,
+            "sys_resp": sys_resp,
+            "sys_action": sys_action,
+            "sys_spans": sys_spans,
+            "state": copy.deepcopy(state)
+        })
+    
+    return {
+        "name": f"{dataset_name}/{subset}/{raw_dialog['dialogue_id']}.json",
+        "rounds": rounds
+    }
+
+def load_raw_sgd_dialogs(sgd_dir: str, subset: str) -> Iterator[SGDDialog]:
+    raw_dialogs_paths = glob.glob(os.path.join(sgd_dir, subset, "dialogues_*.json"))
+
+    for raw_dialogs_path in tqdm(raw_dialogs_paths):
+        yield from utils.load_json(raw_dialogs_path)
+
+SGD_SUBSETS = ("train", "dev", "test")
+
+def convert_save_sgd_dialogs(sgd_dir: str, output_path: str, n_jobs: int, pretty: bool, dataset_name: str):
+    # Dataset metadata
+    metadata: TODMetadata = {
+        "name": dataset_name,
+        "subsets": {subset: [] for subset in SGD_SUBSETS}
+    }
+    # JSON indentation
+    indent = 4 if pretty else None
+    
+    with ZipFile(output_path, "w", ZIP_DEFLATED) as f_archive:
+        pool = mp.Pool(n_jobs)
+
+        # Process SGD subsets
+        try:
+            for subset in SGD_SUBSETS:
+                logger.info(f"Processing subset '{subset}' ...")
+
+                subset_dialogs = metadata["subsets"][subset]
+                # Convert SGD dialogs in parallel
+                for dialog in pool.imap_unordered(
+                    partial(convert_sgd_dialog, dataset_name, subset),
+                    load_raw_sgd_dialogs(sgd_dir, subset)
+                ):
+                    if not dialog:
+                        continue
+
+                    # Add dialog to subset
+                    subset_dialogs.append(dialog["name"])
+                    # Save dialog to archive
+                    utils.save_json(dialog, dialog["name"], root=f_archive, indent=indent)
+        finally:
+            pool.close()
+        
+        # Sort subset dialog names
+        for subset_dialogs in metadata["subsets"].values():
+            subset_dialogs.sort()
+        # Save dataset metadata
+        utils.save_json(metadata, METADATA_PATH, root=f_archive, indent=indent)
+
+SGD_DEFAULT_NAME = "sgd"
+
+def main():
+    parser = ArgumentParser()
+    
+    # CLI arguments
+    parser.add_argument(
+        "-d", "--sgd-dir", required=True, help="path to the DSTC SGD dataset directory"
+    )
+    parser.add_argument(
+        "-o", "--output", default=SGD_DEFAULT_NAME+".zip",
+        help="path to save converted dataset archive"
+    )
+    parser.add_argument(
+        "-j", "--jobs", type=int, default=min(os.cpu_count(), 8),
+        help="number of conversion jobs to run simultaneously"
+    )
+    parser.add_argument(
+        "-p", "--pretty", default=False, action="store_true",
+        help="pretty-print JSON of converted dialogs"
+    )
+    parser.add_argument(
+        "-n", "--name", default=SGD_DEFAULT_NAME, help="name of converted dataset"
+    )
+    # Parse CLI arguments
+    args = parser.parse_args()
+
+    utils.setup_logging()
+    with logging_redirect_tqdm():
+        convert_save_sgd_dialogs(
+            args.sgd_dir, args.output, args.jobs, args.pretty, args.name
+        )
+
+if __name__=="__main__":
+    main()

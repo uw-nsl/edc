@@ -1,0 +1,34 @@
+#! /bin/sh
+
+# Commands directory
+bin_dir="$(dirname $0)"
+
+predict_eval_edc() {
+    exp_name="$1"
+    dataset_file="$2"
+
+    for version in 0 1 2; do
+        echo ">> Evaluating experiment ${exp_name} (version ${version}) ..."
+        echo
+
+        # Create prediction directory
+        pred_dir="${bin_dir}/../preds/main/${exp_name}"
+        mkdir -p "${pred_dir}"
+        # Run prediction
+        dataset_path="${bin_dir}/../data/${dataset_file}"
+        "${bin_dir}/predict-edc" -n "main/${exp_name}/version_${version}" \
+            -d "${dataset_path}" -o "${pred_dir}/${version}.zip" -s test
+        # Evaluate prediction
+        "${bin_dir}/eval-edc" -d "${dataset_path}" -p "${pred_dir}/${version}.zip" -s test
+    done
+}
+
+# MultiWoZ 2.2
+#predict_eval_edc mwoz22 mwoz2.2.zip
+# WoZ 2.0 (without system action)
+#predict_eval_edc woz woz.zip
+
+# M2M (SIM-M, SIM-R and M2M)
+predict_eval_edc sim-m sim-m.zip
+#predict_eval_edc sim-r sim-r.zip
+#predict_eval_edc m2m m2m.zip

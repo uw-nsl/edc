@@ -1,0 +1,31 @@
+#! /bin/sh
+
+# Commands directory
+bin_dir="$(dirname $0)"
+
+train_edc() {
+    exp_name="$1"
+    dataset_file="$2"
+    
+    shift 2
+
+    for seed in 42 4242 424242; do
+        echo ">> Running experiment ${exp_name} with seed ${seed} ..."
+        echo
+
+        "${bin_dir}/train-edc" -n "main/${exp_name}" -d "${bin_dir}/../data/${dataset_file}" \
+            -s "${seed}" "$@"
+
+        echo
+    done
+}
+
+# MultiWoZ 2.2
+#train_edc mwoz22 mwoz2.2.zip
+# WoZ 2.0 (without system action)
+train_edc woz woz.zip --no-sys-action -l 1e-4
+
+# M2M (SIM-M, SIM-R and M2M)
+#train_edc sim-m sim-m.zip -l 5e-5
+#train_edc sim-r sim-r.zip -l 5e-5
+#train_edc m2m m2m.zip -l 5e-5

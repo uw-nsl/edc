@@ -1,0 +1,89 @@
+{
+    "slots": [
+        "pricerange",
+        "type",
+        "parking",
+        "stars",
+        "internet",
+        "name",
+        "area",
+        "address",
+        "phone",
+        "postcode",
+        "arriveby",
+        "departure",
+        "leaveat",
+        "destination",
+        "trainid",
+        "duration",
+        "price",
+        "day",
+        "entrancefee",
+        "openhours",
+        "food",
+        "department",
+        "book day",
+        "book people",
+        "book stay",
+        "book time",
+        "choice",
+        "reference"
+    ],
+    "non_opaque_slots": [
+        "pricerange",
+        "type",
+        "parking",
+        "stars",
+        "internet",
+        "area",
+        "food",
+        "book day",
+        "book people",
+        "book stay"
+    ],
+    "slot_aliases": {
+        "*": {
+            "addr": "address",
+            "post": "postcode",
+            "arrive": "arriveby",
+            "depart": "departure",
+            "leave": "leaveat",
+            "dest": "destination",
+            "price": "pricerange",
+            "day": "book day",
+            "people": "book people",
+            "stay": "book stay",
+            "time": "book time",
+            "bookday": "book day",
+            "bookpeople": "book people",
+            "bookstay": "book stay",
+            "booktime": "book time",
+            "ref": "reference"
+        },
+        "train": {
+            "id": "trainid",
+            "ticket": "price",
+            "day": "day",
+            "price": "price"
+        },
+        "attraction": {
+            "fee": "entrancefee"
+        },
+        "taxi": {
+            "car": "type"
+        }
+    },
+    "word_to_num": {
+        "zero": "0",
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+        "ten": "10"
+    }
+}

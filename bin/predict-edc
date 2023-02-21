@@ -1,0 +1,21 @@
+#! /usr/bin/env python
+from __future__ import annotations
+
+from edc import utils
+from edc.cli import build_cli_arg_parser, build_modules, build_trainer
+
+utils.ignore_pl_warnings()
+
+def main():
+    # Parse CLI arguments
+    parser = build_cli_arg_parser(mode="predict")
+    args = parser.parse_args()
+
+    # Build model, data module and trainer
+    trainer = build_trainer(args, mode="predict")
+    model, data_module = build_modules(args, mode="predict")
+    # Start prediction
+    trainer.predict(model, data_module)
+
+if __name__=="__main__":
+    main()

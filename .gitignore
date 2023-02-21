@@ -1,0 +1,14 @@
+# macOS files
+.DS_Store
+
+# Python files
+*.pyc
+__pycache__
+# Pip files
+*.egg-info
+
+# Generated files
+data
+logs
+preds
+playground

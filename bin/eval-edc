@@ -1,0 +1,33 @@
+#! /usr/bin/env python3
+from __future__ import annotations
+
+from argparse import ArgumentParser
+
+from edc.data import evaluate_preds
+
+def main():
+    # CLI arguments parser
+    parser = ArgumentParser(description="evaluate dialog state predictions")
+    # Add CLI arguments
+    parser.add_argument(
+        "-d", "--dataset", required=True, help="path to TOD dataset archive"
+    )
+    parser.add_argument(
+        "-p", "--prediction", required=True,
+        help="path to dialog state prediction archive"
+    )
+    parser.add_argument(
+        "-s", "--subset", default="dev", choices=["train", "dev", "test"],
+        help="subset of given datasets for prediction"
+    )
+    # Parse CLI arguments
+    args = parser.parse_args()
+
+    # Evaluate predictions
+    joint_accuracy = evaluate_preds(args.dataset, args.prediction, args.subset)
+    # Print evaluation results
+    print("[TOD Evaluation]")
+    print(f"* JGA: {joint_accuracy}")
+
+if __name__=="__main__":
+    main()

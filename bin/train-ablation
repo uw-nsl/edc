@@ -1,0 +1,32 @@
+#! /bin/sh
+
+# Commands directory
+bin_dir="$(dirname $0)"
+
+train_edc() {
+    for seed in 42 4242 424242; do
+        echo ">> Running ablation experiment with seed ${seed} and parameters '$@' ..."
+        echo
+
+        "${bin_dir}/train-edc" -d "${bin_dir}/../data/mwoz2.2.zip" -s "${seed}" "$@"
+
+        echo
+    done
+}
+
+# Full
+train_edc -n ablation/full
+
+# Without user action
+train_edc -n ablation/no-ua --no-user-action
+# Without system action
+train_edc -n ablation/no-sa --no-sys-action
+# Without user and system action
+train_edc -n ablation/no-ua-sa --no-user-action --no-sys-action
+
+# One-pass prediction
+train_edc -n ablation/one-pass --one-pass
+# Standalone context encoding
+train_edc -n ablation/sa-ctx --standalone-ctx
+# One-pass prediction with standalone context encoding
+train_edc -n ablation/one-pass-sa-ctx --one-pass --standalone-ctx
