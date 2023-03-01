@@ -9,10 +9,10 @@ from torch.nn import functional as f
 from transformers import AutoTokenizer
 
 from .. import utils
-from ..data import Role, Task, get_edc_special_tokens, pred_states_tree, pred_states_one_pass
+from ..data import get_edc_special_tokens, pred_states_tree, pred_states_one_pass
 from .transformer import TransformerModel
 from .patch import BART_SKIP_POS_EMBED
-from .decode import greedy_decode
+from .decode import greedy_decode, beam_search_decode
 
 if TYPE_CHECKING:
     from typing import Any, Optional
@@ -183,8 +183,6 @@ class EDCModel(TransformerModel):
 
         # Cross entropy losses
         l = f.cross_entropy(target_logits, target_ids)
-        #l = l/len(decoder_data.target_token_ids)
-
         # Accuracy
         acc = (target_logits.argmax(-1)==target_ids).float().mean()
         

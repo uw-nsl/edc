@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser
+from textwrap import dedent
 
 from edc.data import evaluate_preds
 
@@ -24,10 +25,19 @@ def main():
     args = parser.parse_args()
 
     # Evaluate predictions
-    joint_accuracy = evaluate_preds(args.dataset, args.prediction, args.subset)
+    eval_result = evaluate_preds(args.dataset, args.prediction, args.subset)
     # Print evaluation results
-    print("[TOD Evaluation]")
-    print(f"* JGA: {joint_accuracy}")
+    print(dedent(f"""\
+    >>>>> DST Evaluation <<<<<
+
+    [DST Metrics]
+    * # of rounds: {eval_result['n_rounds']}
+    * # of correct rounds: {eval_result['n_correct_rounds']}
+    * Joint accuracy: {eval_result['joint_accuracy']}
+
+    [Incorrect Examples]
+    (TBD)
+    """))
 
 if __name__=="__main__":
     main()

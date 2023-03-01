@@ -4,14 +4,27 @@ from typing import TYPE_CHECKING
 
 from zipfile import ZipFile
 
-import numpy as np
 from Levenshtein import distance as lev_distance
 
 from edc import utils
 from edc.data import METADATA_PATH
 
 if TYPE_CHECKING:
+    from typing import TypedDict
+
     from ..types import TODState, TODMetadata
+
+    class DSTIncorrectSample(TypedDict):
+        ctx: list[str]
+        pred: TODState
+        actual: TODState
+
+    class DSTEvalResult(TypedDict):
+        n_rounds: int
+        n_correct_rounds: int
+        joint_accuracy: float
+
+        incorrect_samples: list[DSTIncorrectSample]
 
 __all__ = [
     "state_matches",
@@ -46,7 +59,7 @@ def state_matches(pred_state: TODState, target_state: TODState, max_lev_dist_fac
 
     return True
 
-def evaluate_preds(dataset_path: str, preds_path: str, subset: str) -> float:
+def evaluate_preds(dataset_path: str, preds_path: str, subset: str) -> DSTEvalResult:
     # Number of total and correct rounds
     n_rounds = 0
     n_correct_rounds = 0
@@ -55,18 +68,47 @@ def evaluate_preds(dataset_path: str, preds_path: str, subset: str) -> float:
         # Get dialog paths in the subset
         metadata: TODMetadata = utils.load_json(METADATA_PATH, root=f_archive_dataset)
         dialog_paths = metadata["subsets"][subset]
+        # Incorrect samples
+        incorrect_samples: list[DSTIncorrectSample] = []
 
         for dialog_path in dialog_paths:
             # Load dialog and predictions
             dialog = utils.load_json(dialog_path, root=f_archive_dataset)
             preds = utils.load_json(dialog_path, root=f_archive_preds)
+            # Dialog context
+            ctx: list[str] = []
 
             # Evaluate predictions for rounds
             for round, round_pred in zip(dialog["rounds"], preds["preds"]):
+                # Save user utterance
+                ctx.append(round["user_input"])
+
+                # Update number of rounds
                 n_rounds += 1
-                n_correct_rounds += int(state_matches(round["state"], round_pred["state"]))
-    
+                # Get predicted and actual dialog states
+                actual = round["state"]
+                pred = round_pred["state"]
+
+                # Update number of correct rounds
+                if state_matches(pred, actual):
+                    n_correct_rounds += 1
+                # Gather incorrect samples
+                else:
+                    incorrect_samples.append({
+                        "ctx": ctx.copy(),
+                        "pred": pred,
+                        "actual": actual
+                    })
+                
+                # Save system utterance
+                ctx.append(round["sys_resp"])
+        
     # Compute JGA
     joint_accuracy = n_correct_rounds/n_rounds
 
-    return joint_accuracy
+    return {
+        "n_rounds": n_rounds,
+        "n_correct_rounds": n_correct_rounds,
+        "joint_accuracy": joint_accuracy,
+        "incorrect_samples": incorrect_samples
+    }

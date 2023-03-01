@@ -92,6 +92,30 @@ class TopKFilter(Filter):
     def __call__(self, step_scores: torch.Tensor) -> FilterResult:
         return utils.topk(step_scores, self.k, sorted=False)
 
+class TopPFilter(Filter):
+    def __init__(self, p: float):
+        self.p = p
+    
+    def __call__(self, step_scores: torch.Tensor) -> FilterResult:
+        # Sort scores of current step
+        sorted_step_scores, sorted_items = step_scores.sort(descending=True)
+        # Compute cumulative probabilities and step mask
+        cum_probs = sorted_step_scores.softmax(-1).cumsum(-1)
+        step_mask = cum_probs<self.p
+        step_mask[:, 0] = True
+
+        # Compute number of top items
+        n_top_items = step_mask.sum(-1).max().item()
+        # Gather top items with mask
+        top_step_items = torch.where(step_mask, sorted_items, _DUMMY_ITEM)
+        top_step_items = top_step_items[:, :n_top_items]
+        # Gather top scores with mask
+        dummy_score = torch.finfo(step_scores.dtype).min
+        top_step_scores = torch.where(step_mask, sorted_step_scores, dummy_score)
+        top_step_scores = top_step_scores[:, :n_top_items]
+
+        return top_step_scores, top_step_items
+
 class BeamScorer(Scorer):
     def __init__(self, filter: Filter, max_beams: int):
         self.filter = filter
@@ -235,14 +259,24 @@ def decode(decoder: Decoder[S], scorer: Scorer, start_items: torch.Tensor, start
     
     return decode_outputs
 
-def beam_search_decode(decoder: Decoder[S], k: int, max_beams: int, start_items: torch.Tensor, start_states: list[S],
-    max_len: int, end_item: int, n_outputs: int) -> list[list[DecodeOutput[S]]]:
+def beam_search_decode(decoder: Decoder[S], max_beams: int, start_items: torch.Tensor, start_states: list[S],
+    max_len: int, end_items: list[int], n_outputs: int, k: Optional[int] = None, p: Optional[float] = None
+    ) -> list[list[DecodeOutput[S]]]:
+    if k is not None and p is not None:
+        raise ValueError("cannot specify both `k` and `p` for beam search")
+    elif k is not None:
+        filter = TopKFilter(k)
+    elif p is not None:
+        filter = TopPFilter(p)
+    else:
+        raise ValueError("either `k` or `p` should be specified for beam search")
+
     return decode(
         decoder,
-        scorer=BeamScorer(TopKFilter(k), max_beams),
+        scorer=BeamScorer(filter, max_beams),
         start_items=start_items,
         start_states=start_states,
-        stop_cond=DefaultStopCond(max_len, end_item),
+        stop_cond=DefaultStopCond(max_len, end_items),
         n_outputs=n_outputs
     )
 

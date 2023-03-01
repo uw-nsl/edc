@@ -43,9 +43,9 @@ def build_trainer(args: Namespace, mode: str) -> Trainer:
         # Enable checkpointing
         callbacks = [ModelCheckpoint(
             filename="model",
-            #monitor="val_accuracy",
+            monitor="val_accuracy",
             save_weights_only=True,
-            #mode="max"
+            mode="max"
         )]
         # Logging
         logger = TensorBoardLogger(save_dir="logs", name=args.name)

@@ -23,9 +23,9 @@ train_edc() {
 # MultiWoZ 2.2
 #train_edc mwoz22 mwoz2.2.zip
 # WoZ 2.0 (without system action)
-train_edc woz woz.zip --no-sys-action -l 1e-4
+train_edc woz woz.zip -l 5e-5
 
 # M2M (SIM-M, SIM-R and M2M)
-#train_edc sim-m sim-m.zip -l 5e-5
-#train_edc sim-r sim-r.zip -l 5e-5
-#train_edc m2m m2m.zip -l 5e-5
+train_edc sim-m sim-m.zip -l 2e-5 -e 7
+train_edc sim-r sim-r.zip
+train_edc m2m m2m.zip

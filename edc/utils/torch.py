@@ -24,7 +24,6 @@ __all__ = [
     "init_embed_weight",
     "pad_cat_tensors",
     "pad_stack_tensors",
-    "seq_focal_loss",
     "topk"
 ]
 
@@ -102,48 +101,6 @@ def topk(inputs: torch.Tensor, k: int, dim: int = -1, largest: bool = True, sort
             indices = indices.reshape(compat_shape).expand_as(inputs).contiguous()
         
     return values, indices
-
-def seq_focal_loss(inputs: torch.Tensor, targets: torch.Tensor, seq_lens: torch.Tensor,
-    gamma: float = 1., approx_threshold: float = -1e-4, reduction: str = "mean") -> torch.Tensor:
-    # Get normalized logits for target class
-    target_logits = inputs.log_softmax(-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-
-    # Sum logits for sequences
-    n_seqs = len(seq_lens)
-    seq_indices = torch.arange(n_seqs, device=inputs.device).repeat_interleave(seq_lens)
-    sum_logits = target_logits.new_zeros(n_seqs).index_add_(0, seq_indices, target_logits)
-
-    # Logits don't need scaling for cross entropy
-    if gamma==0.:
-        loss = -sum_logits
-    else:
-        # Mean token logits for sequences
-        mean_logits = sum_logits/seq_lens.to(sum_logits)
-        # Clamp probabilities to avoid NaN
-        eps = torch.finfo(mean_logits.dtype).eps
-
-        # Exact focal loss scales
-        scales_exact = 1-mean_logits.exp().clamp(eps/gamma)
-        if gamma!=1.:
-            scales_exact = scales_exact**gamma
-        # Approximate focal loss scales
-        scales_approx = -mean_logits
-        if gamma!=1.:
-            scales_approx = scales_approx**gamma
-        
-        # Apply focal loss scales
-        scales = torch.where(mean_logits<approx_threshold, scales_exact, scales_approx)
-        loss = -scales*sum_logits
-    
-    # Apply reduction to losses
-    if reduction=="none":
-        return loss
-    elif reduction=="mean":
-        return loss.mean()
-    elif reduction=="sum":
-        return loss.sum()
-    else:
-        raise ValueError(f"unknown reduction method: '{reduction}'")
 
 @torch.no_grad()
 def init_embed_weight(target: torch.Tensor, source: torch.Tensor):
