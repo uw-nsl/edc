@@ -18,7 +18,7 @@ predict_eval_edc() {
         mkdir -p "${pred_dir}"
         # Run prediction
         "${bin_dir}/predict-edc" -n "ablation/${setting}/version_${version}" \
-            -d "${mwoz22_path}" -o "${pred_dir}/${version}.zip" "$@"
+            -d "${mwoz22_path}" -o "${pred_dir}/${version}.zip" -s test "$@"
         # Evaluate prediction
         "${bin_dir}/eval-edc" -d "${mwoz22_path}" -p "${pred_dir}/${version}.zip" -s test
     done
@@ -35,8 +35,8 @@ predict_eval_edc no-sa
 predict_eval_edc no-ua-sa
 
 # One-pass prediction
-predict_eval_edc one-pass --one-pass
+#predict_eval_edc one-pass --one-pass
 # Standalone context encoding
 predict_eval_edc sa-ctx --standalone-ctx
 # One-pass prediction with standalone context encoding
-predict_eval_edc one-pass-sa-ctx --one-pass --standalone-ctx
+#predict_eval_edc one-pass-sa-ctx --one-pass --standalone-ctx

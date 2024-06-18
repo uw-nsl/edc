@@ -15,18 +15,18 @@ train_edc() {
 }
 
 # Full
-train_edc -n ablation/full
+train_edc -n ablation/full --measure-forward
 
 # Without user action
-train_edc -n ablation/no-ua --no-user-action
+#train_edc -n ablation/no-ua --no-user-action
 # Without system action
-train_edc -n ablation/no-sa --no-sys-action
+#train_edc -n ablation/no-sa --no-sys-action
 # Without user and system action
-train_edc -n ablation/no-ua-sa --no-user-action --no-sys-action
+#train_edc -n ablation/no-ua-sa --no-user-action --no-sys-action
 
 # One-pass prediction
-train_edc -n ablation/one-pass --one-pass
+train_edc -n ablation/one-pass --one-pass --measure-forward
 # Standalone context encoding
-train_edc -n ablation/sa-ctx --standalone-ctx
+train_edc -n ablation/sa-ctx --standalone-ctx --measure-forward -l 5e-5
 # One-pass prediction with standalone context encoding
-train_edc -n ablation/one-pass-sa-ctx --one-pass --standalone-ctx
+train_edc -n ablation/one-pass-sa-ctx --one-pass --standalone-ctx --measure-forward -l 5e-5

@@ -8,6 +8,7 @@ __all__ = [
     "DataType",
     "Task",
     "SpecialToken",
+    "ExtSlotInfo",
     "ContextSegment",
     "TargetDataPath",
     "TargetSeqs",
@@ -17,14 +18,18 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from typing import Any, TypedDict, Union
+    from typing import Any, Protocol, TypedDict, Union
 
     import torch
 
     from ..types import TODAction, TODState
 
+    class SupportsStr(Protocol):
+        """ Type that supports __str__ magic method. """
+        def __str__(self) -> str: ...
+
     # Tree-structured data
-    TreeData = Union[dict[str, "TreeData"], list[str], str]
+    TreeData = Union[dict[str, "TreeData"], list[SupportsStr], SupportsStr]
     # Single data sample
     EDCSample = tuple["EncoderData", "DecoderData"]
 
@@ -58,9 +63,6 @@ class Task(Enum):
     DIALOG_STATE = 1
     SYS_ACTION = 2
 
-    # temp
-    MLM = 3
-
 class SpecialToken(Enum):
     """ Special token families. """
     # Utterances
@@ -92,6 +94,14 @@ class SpecialToken(Enum):
 
         return token
 
+class ExtSlotInfo(NamedTuple):
+    """ Data type with slot value and other extended slot information. """
+    slot_value: str
+    is_copied: bool
+
+    def __str__(self) -> str:
+        return self.slot_value
+
 class ContextSegment(NamedTuple):
     """ A context segment containing user or system utterances. """
     round_id: int
@@ -120,9 +130,11 @@ class TargetDataPath(NamedTuple):
 class TargetSeqs(NamedTuple):
     round_id: int
     role: Role
+    task: Task
 
     token_ids: list[list[int]]
     target_prompt_lens: list[int]
+    target_weights: list[float]
 
 class EncoderData(NamedTuple):
     """ Data needed for the encoder part of the model. """
@@ -138,6 +150,7 @@ class DecoderData(NamedTuple):
     target_output_masks: torch.Tensor
 
     ctx_indices: torch.Tensor
+    target_weights: torch.Tensor
 
 class PredData(NamedTuple):
     """ Data needed for dialog state and action prediction. """

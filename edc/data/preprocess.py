@@ -3,19 +3,26 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from array import array
-from itertools import product
+from itertools import product, repeat
 
 import torch
 
 from .. import utils
-from .types import Role, DataType, Task, SpecialToken as ST, ContextSegment, TargetDataPath, \
-    TargetSeqs, EncoderData, DecoderData
+from .types import Role, DataType, Task, SpecialToken as ST, ExtSlotInfo, \
+    ContextSegment, TargetDataPath, TargetSeqs, EncoderData, DecoderData
 
 if TYPE_CHECKING:
     from typing import Optional
 
-    from ..types import Tokenizer, TODDialog
+    from ..types import Tokenizer, TODDialog, TODState, TODSpans
     from .types import TreeData
+
+    # Slot occurrence table
+    OccurrenceTable = dict[str, set[tuple[str, str]]]
+    # Extended domain state
+    ExtDomainState = dict[str, ExtSlotInfo]
+    # Extended dialog state
+    ExtState = dict[str, ExtDomainState]
 
 __all__ = [
     "ACTION_DATA_TYPES",
@@ -70,8 +77,31 @@ SPECIAL_DATA_NORM_MAPPING = {
     "@notcare": "@ not care"
 }
 
-def make_tree_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Task,
-    data: TreeData) -> TargetSeqs:
+def gather_occurrence(occurrence_table: OccurrenceTable, spans: TODSpans):
+    for domain, domain_spans in spans.items():
+        for slot_name, slot_spans in domain_spans.items():
+            for slot_value, _, _ in slot_spans:
+                occurrence_table.setdefault(slot_value, set()).add((domain, slot_name))
+
+def make_ext_state(state: TODState, occurrence_table: OccurrenceTable) -> ExtState:
+    ext_state: ExtState = {}
+
+    for domain, domain_state in state.items():
+        ext_domain_state: ExtDomainState = {}
+
+        for slot_name, slot_value in domain_state.items():
+            # Check whether slot value is copied from context
+            slot_occurrences = occurrence_table.get(slot_value, ())
+            is_copied = (domain, slot_name) in slot_occurrences
+            # Save extended slot information
+            ext_domain_state[slot_name] = ExtSlotInfo(slot_value, is_copied)
+        
+        ext_state[domain] = ext_domain_state
+    
+    return ext_state
+
+def make_tree_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Task, data: TreeData,
+    slot_name_weight: float = 1., non_copied_value_weight: float = 1.) -> TargetSeqs:
     # Data type hierarchy for task
     data_types = STATE_DATA_TYPES if task==Task.DIALOG_STATE else ACTION_DATA_TYPES
     # Traversal queue
@@ -79,8 +109,10 @@ def make_tree_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Task,
 
     # Token IDs of target sequences
     target_token_ids: list[list[int]] = []
-    # Lengths of target prompts
+    # target prompt lengths
     target_prompt_lens: list[int] = []
+    # Target sequence weights
+    target_weights: list[float] = []
 
     while traversal_queue:
         path, data = traversal_queue.pop()
@@ -110,6 +142,7 @@ def make_tree_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Task,
             if i>0:
                 tokens.append(ST.N_SEP(current_data_type))
             # Key data
+            key = str(key)
             norm_key = SPECIAL_DATA_NORM_MAPPING.get(key, key)
             tokens.extend(tokenizer.tokenize(norm_key))
         # Children end and end token
@@ -119,11 +152,29 @@ def make_tree_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Task,
         # Save target token IDs
         target_token_ids.append(token_ids)
 
+        # Dialog state
+        if task==Task.DIALOG_STATE:
+            # Slot names prediction
+            if current_data_type==DataType.SLOT_NAME:
+                target_weight = slot_name_weight
+            # Non-copied slot value prediction
+            elif current_data_type==DataType.SLOT_VALUE and isinstance(data[0], ExtSlotInfo) \
+                and not data[0].is_copied:
+                target_weight = non_copied_value_weight
+            # Other situations
+            else:
+                target_weight = 1.
+        # User or system actions
+        else:
+            target_weight = 1.
+        # Save target sequence weight
+        target_weights.append(target_weight)
+
         # Traverse through children
         if isinstance(data, dict):
             traversal_queue.extend((path.with_ancestor(key), data[key]) for key in keys)
     
-    return TargetSeqs(round_id, role, target_token_ids, target_prompt_lens)
+    return TargetSeqs(round_id, role, task, target_token_ids, target_prompt_lens, target_weights)
 
 def make_one_pass_impl(tokenizer: Tokenizer, data: TreeData, data_types: tuple[DataType, ...],
     level: int) -> list[str]:
@@ -144,6 +195,7 @@ def make_one_pass_impl(tokenizer: Tokenizer, data: TreeData, data_types: tuple[D
         if i>0:
             tokens.append(ST.N_SEP(current_data_type))
         # Key data
+        key = str(key)
         norm_key = SPECIAL_DATA_NORM_MAPPING.get(key, key)
         tokens.extend(tokenizer.tokenize(norm_key))
         # Traverse through children
@@ -154,8 +206,8 @@ def make_one_pass_impl(tokenizer: Tokenizer, data: TreeData, data_types: tuple[D
 
     return tokens
 
-def make_one_pass_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Task, data: TreeData
-    ) -> TargetSeqs:
+def make_one_pass_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Task, data: TreeData,
+    _1: float = 1., _2: float = 1.) -> TargetSeqs:
     # Data type hierarchy for task
     data_types = STATE_DATA_TYPES if task==Task.DIALOG_STATE else ACTION_DATA_TYPES
 
@@ -169,7 +221,7 @@ def make_one_pass_seqs(tokenizer: Tokenizer, round_id: int, role: Role, task: Ta
     # Convert tokens into IDs
     token_ids = tokenizer.convert_tokens_to_ids(tokens)
     # Wrap single sequence
-    return TargetSeqs(round_id, role, [token_ids], [0])
+    return TargetSeqs(round_id, role, task, [token_ids], [0], [1.])
 
 def tokenize_utterance(tokenizer: Tokenizer, utterance: str, role: Role, round_id: int) -> list[int]:
     # Tokenize utterance
@@ -184,10 +236,13 @@ def tokenize_utterance(tokenizer: Tokenizer, utterance: str, role: Role, round_i
     return token_ids
 
 def preprocess_data(tokenizer: Tokenizer, dialog: TODDialog, max_rounds: int, max_ctx_len: int,
-    with_user_action: bool, with_sys_action: bool, one_pass: bool, standalone_round_idx: Optional[int] = None
+    slot_name_weight: float, non_copied_value_weight: float, with_user_action: bool,
+    with_sys_action: bool, one_pass: bool, standalone_round_idx: Optional[int] = None
     ) -> tuple[list[ContextSegment], list[TargetSeqs]]:
     ctx_segments: list[ContextSegment] = []
     target_seqs: list[TargetSeqs] = []
+
+    occurrence_table: OccurrenceTable = {}
 
     # Make tree or one pass sequences
     make_seqs = make_one_pass_seqs if one_pass else make_tree_seqs
@@ -210,15 +265,25 @@ def preprocess_data(tokenizer: Tokenizer, dialog: TODDialog, max_rounds: int, ma
         # Make user segment
         ctx_segments.append(ContextSegment(i, Role.USER, user_input_ids))
 
+        # Gather slot value occurrence for user
+        emphasize_non_copied_value = non_copied_value_weight!=1.
+        if emphasize_non_copied_value:
+            gather_occurrence(occurrence_table, round["user_spans"])
         # Make target sequences for user action
-        if with_user_action and save_seqs:
+        if save_seqs and with_user_action:
             target_seqs.append(make_seqs(
                 tokenizer, i, Role.USER, Task.USER_ACTION, round["user_action"]
             ))
+        
         # Make target sequences for dialog state
         if save_seqs:
+            state = round["state"]
+            if emphasize_non_copied_value!=1.:
+                state = make_ext_state(state, occurrence_table)
+            
             target_seqs.append(make_seqs(
-                tokenizer, i, Role.USER, Task.DIALOG_STATE, round["state"]
+                tokenizer, i, Role.USER, Task.DIALOG_STATE, state,
+                slot_name_weight, non_copied_value_weight
             ))
         
         # Exit early in standalone mode
@@ -235,8 +300,11 @@ def preprocess_data(tokenizer: Tokenizer, dialog: TODDialog, max_rounds: int, ma
         # Make system segment
         ctx_segments.append(ContextSegment(i, Role.SYSTEM, sys_resp_ids))
 
+        # Gather slot value occurrence for system
+        if emphasize_non_copied_value:
+            gather_occurrence(occurrence_table, round["sys_spans"])
         # Make target sequences for system action
-        if with_sys_action and save_seqs:
+        if save_seqs and with_sys_action:
             target_seqs.append(make_seqs(
                 tokenizer, i, Role.SYSTEM, Task.SYS_ACTION, round["sys_action"]
             ))
@@ -307,6 +375,7 @@ def make_decoder_data(target_seqs: list[TargetSeqs], standalone_ctx: bool = Fals
     target_output_masks: list[torch.Tensor] = []
 
     ctx_indices = array("q")
+    target_weights = array("f")
 
     for seqs in target_seqs:
         # Context index is 0 for standalone mode
@@ -327,14 +396,19 @@ def make_decoder_data(target_seqs: list[TargetSeqs], standalone_ctx: bool = Fals
             target_output_mask = torch.ones(len(token_ids), dtype=torch.bool)
             target_output_mask[:target_prompt_len+1] = False
             target_output_masks.append(target_output_mask)
-
-            # Context index
-            ctx_indices.append(ctx_index)
+        
+        n_seqs = len(seqs.token_ids)
+        
+        # Context index
+        ctx_indices.extend(repeat(ctx_index, n_seqs))
+        # Target weights
+        target_weights.extend(seqs.target_weights)
     
     # Collate decoder data
     return DecoderData(
         utils.pad_stack_tensors(target_token_ids, pad_value=-1),
         utils.pad_stack_tensors(decoder_self_attn_masks),
         utils.pad_stack_tensors(target_output_masks),
-        utils.as_tensor(ctx_indices)
+        utils.as_tensor(ctx_indices),
+        utils.as_tensor(target_weights)
     )

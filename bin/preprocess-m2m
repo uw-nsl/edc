@@ -79,10 +79,14 @@ def convert_spans(tokens: list[str], raw_spans: list[M2MSlot], domain: str) -> T
     for raw_span in raw_spans:
         slot_name = normalize_intent_slot_name(raw_span["slot"])
 
-        span_start = char_indices[raw_span["start"]]
-        span_end = char_indices[raw_span["exclusive_end"]]-1
+        raw_start = raw_span["start"]
+        raw_end = raw_span["exclusive_end"]
 
-        domain_spans.setdefault(slot_name, []).append((span_start, span_end))
+        slot_value = " ".join(tokens[raw_start:raw_end])
+        span_start = char_indices[raw_start]
+        span_end = char_indices[raw_end]-1
+
+        domain_spans.setdefault(slot_name, []).append((slot_value, span_start, span_end))
     
     return {domain: domain_spans} if domain_spans else {}
 
@@ -97,7 +101,7 @@ def convert_actions(raw_actions: list[M2MAction], utterance: str, spans: TODSpan
         if intent=="inform":
             for slot_name, slot_spans in spans.get(domain, {}).items():
                 slots[slot_name] = [
-                    normalize_slot_value(utterance[span[0]:span[1]]) \
+                    normalize_slot_value(utterance[span[1]:span[2]]) \
                     for span in slot_spans
                 ]
         else:
@@ -154,7 +158,7 @@ def convert_m2m_dialog(raw_dialog: M2MDialog, domain: str, dataset_name: str) ->
         # Make dummy annotations for last turn
         else:
             sys_resp = M2M_DUMMY_SYS_RESP
-            sys_spans: TODSpans = []
+            sys_spans: TODSpans = {}
             sys_action = {domain: M2M_DUMMY_SYS_DOMAIN_ACTION}
 
         # Store current round

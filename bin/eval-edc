@@ -1,10 +1,35 @@
 #! /usr/bin/env python3
 from __future__ import annotations
 
+import random, itertools, textwrap
 from argparse import ArgumentParser
-from textwrap import dedent
 
 from edc.data import evaluate_preds
+
+def make_preds_report(eval_result, n_incorrect_samples: int = 0) -> str:
+    report = textwrap.dedent(f"""\
+    >>>>> DST Evaluation <<<<<
+    [[ DST Metrics ]]
+    * # of rounds: {eval_result['n_rounds']}
+    * # of correct rounds: {eval_result['n_correct_rounds']}
+    * Joint accuracy: {eval_result['joint_accuracy']}
+    
+    """)
+
+    if n_incorrect_samples>0:
+        incorrect_examples = random.sample(eval_result["incorrect_samples"], n_incorrect_samples)
+        
+        report += "[[ Incorrect Samples ]]\n"
+        for i, example in enumerate(incorrect_examples):
+            report += f"[ Sample {i+1} ]\n"
+            
+            for utterance, prefix in zip(example["ctx"], itertools.cycle((">", "<"))):
+                report += f"{prefix} {utterance}\n"
+            
+            report += f"\nPredicted state: {example['pred']}\n"
+            report += f"Actual state: {example['actual']}\n\n"
+    
+    return report
 
 def main():
     # CLI arguments parser
@@ -21,23 +46,17 @@ def main():
         "-s", "--subset", default="dev", choices=["train", "dev", "test"],
         help="subset of given datasets for prediction"
     )
+    parser.add_argument(
+        "--incorrect-samples", type=int, default=0,
+        help="number of incorrect DST samples to display"
+    )
     # Parse CLI arguments
     args = parser.parse_args()
 
     # Evaluate predictions
     eval_result = evaluate_preds(args.dataset, args.prediction, args.subset)
-    # Print evaluation results
-    print(dedent(f"""\
-    >>>>> DST Evaluation <<<<<
-
-    [DST Metrics]
-    * # of rounds: {eval_result['n_rounds']}
-    * # of correct rounds: {eval_result['n_correct_rounds']}
-    * Joint accuracy: {eval_result['joint_accuracy']}
-
-    [Incorrect Examples]
-    (TBD)
-    """))
+    # Print evaluation report
+    print(make_preds_report(eval_result, n_incorrect_samples=args.incorrect_samples))
 
 if __name__=="__main__":
     main()

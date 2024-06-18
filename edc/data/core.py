@@ -11,13 +11,11 @@ from torch.utils.data import DataLoader
 from pytorch_lightning import LightningDataModule
 
 from .. import utils
-from ..utils import EnumerateDataset
 from .preprocess import get_edc_special_tokens, preprocess_data, make_shared_encoder_data, \
     make_standalone_encoder_data, make_decoder_data
 
 if TYPE_CHECKING:
     from ..types import TODMetadata, TODDialog, Tokenizer
-    from .types import EDCSample
 
 __all__ = [
     "METADATA_PATH",
@@ -28,15 +26,17 @@ METADATA_PATH = "metadata.json"
 
 class EDCDatasetBase:
     def __init__(self, dataset_path: str, subset: str, transformer_name: str, max_rounds: int,
-        max_ctx_len: int, with_user_action: bool, with_sys_action: bool, one_pass: bool,
-        with_index: bool = False):
+        max_ctx_len: int, slot_name_weight: float, non_copied_value_weight: float,
+        with_user_action: bool, with_system_action: bool, one_pass: bool, with_index: bool = False):
         self.dataset_path = dataset_path
         self.subset = subset
         self.transformer_name = transformer_name
         self.max_rounds = max_rounds
         self.max_ctx_len = max_ctx_len
+        self.slot_name_weight = slot_name_weight
+        self.non_copied_value_weight = non_copied_value_weight
         self.with_user_action = with_user_action
-        self.with_sys_action = with_sys_action
+        self.with_system_action = with_system_action
         self.one_pass = one_pass
         self.with_index = with_index
     
@@ -62,8 +62,10 @@ class EDCDatasetBase:
             self.transformer_name,
             self.max_rounds,
             self.max_ctx_len,
+            self.slot_name_weight,
+            self.non_copied_value_weight,
             self.with_user_action,
-            self.with_sys_action,
+            self.with_system_action,
             self.one_pass,
             self.with_index
         )
@@ -87,8 +89,9 @@ class EDCSharedDataset(EDCDatasetBase):
         
         # Pre-process dialog data
         ctx_segments, target_seqs = preprocess_data(
-            tokenizer, dialog, self.max_rounds, self.max_ctx_len,
-            self.with_user_action, self.with_sys_action, self.one_pass
+            tokenizer, dialog, self.max_rounds, self.max_ctx_len, self.slot_name_weight,
+            self.non_copied_value_weight, self.with_user_action, self.with_system_action,
+            self.one_pass
         )
         # Make encoder and decoder data
         encoder_data = make_shared_encoder_data(ctx_segments, tokenizer.bos_token_id)
@@ -128,9 +131,9 @@ class EDCStandaloneDataset(EDCDatasetBase):
 
         # Pre-process dialog data
         ctx_segments, target_seqs = preprocess_data(
-            tokenizer, dialog, self.max_rounds, self.max_ctx_len,
-            self.with_user_action, self.with_sys_action, self.one_pass,
-            standalone_round_idx=round_idx
+            tokenizer, dialog, self.max_rounds, self.max_ctx_len, self.slot_name_weight,
+            self.non_copied_value_weight, self.with_user_action, self.with_system_action,
+            self.one_pass, standalone_round_idx=round_idx
         )
         # Make encoder and decoder data
         encoder_data = make_standalone_encoder_data(ctx_segments, tokenizer.bos_token_id)
@@ -144,19 +147,21 @@ class EDCStandaloneDataset(EDCDatasetBase):
 
 class EDCDataModule(LightningDataModule):
     def __init__(self, dataset_path: str, transformer_name: str, max_rounds: int, max_ctx_len: int,
-        with_user_action: bool, with_sys_action: bool, one_pass: bool, standalone_ctx: bool,
-        batch_size: int, n_workers: int, predict_subset: str):
+        slot_name_weight: float, non_copied_value_weight: float, with_user_action: bool,
+        with_system_action: bool, one_pass: bool, standalone_ctx: bool, n_workers: int,
+        predict_subset: str):
         super().__init__()
 
         self.dataset_path = dataset_path
         self.transformer_name = transformer_name
         self.max_rounds = max_rounds
         self.max_ctx_len = max_ctx_len
+        self.slot_name_weight = slot_name_weight
+        self.non_copied_value_weight = non_copied_value_weight
         self.with_user_action = with_user_action
-        self.with_sys_action = with_sys_action
+        self.with_system_action = with_system_action
         self.one_pass = one_pass
         self.standalone_ctx = standalone_ctx
-        self.batch_size = batch_size
         self.n_workers = n_workers
         self.predict_subset = predict_subset
 
@@ -173,8 +178,10 @@ class EDCDataModule(LightningDataModule):
             self.transformer_name,
             self.max_rounds,
             self.max_ctx_len,
+            self.slot_name_weight,
+            self.non_copied_value_weight,
             self.with_user_action,
-            self.with_sys_action,
+            self.with_system_action,
             self.one_pass,
             with_index
         )

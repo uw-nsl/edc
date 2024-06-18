@@ -94,11 +94,12 @@ def build_modules(args: Namespace, mode: str) -> tuple[EDCModel, EDCDataModule]:
         transformer_name=args.transformer_name,
         max_rounds=args.max_rounds,
         max_ctx_len=args.max_ctx_len,
+        slot_name_weight=args.slot_name_weight,
+        non_copied_value_weight=args.non_copied_value_weight,
         with_user_action=not args.no_user_action,
-        with_sys_action=not args.no_sys_action,
+        with_system_action=not args.no_sys_action,
         one_pass=args.one_pass,
         standalone_ctx=args.standalone_ctx,
-        batch_size=args.batch_size,
         n_workers=args.n_workers,
         predict_subset=getattr(args, "subset", "dev")
     )
@@ -113,6 +114,7 @@ def build_modules(args: Namespace, mode: str) -> tuple[EDCModel, EDCDataModule]:
         # Create model based 
         model = EDCModel(
             max_rounds=args.max_rounds,
+            measure_forward=args.measure_forward,
             transformer_name=args.transformer_name,
             learning_rate=args.learning_rate,
             skip_init_model=False
@@ -142,13 +144,23 @@ def build_cli_arg_parser(mode: str) -> ArgumentParser:
 
     # Data and model arguments
     parser.add_argument("-d", "--dataset", required=True, help="path to JSON dataset file")
-    parser.add_argument("-b", "--batch-size", type=int, help="batch size")
     parser.add_argument(
         "--max-rounds", type=int, default=24,
         help="maximum number of dialog rounds included as context"
     )
     parser.add_argument(
+        "--measure-forward", default=False, action="store_true",
+        help="measure execution time of the forward pass"
+    )
+    parser.add_argument(
         "--max-ctx-len", type=int, default=1024, help="maximum context sequence length"
+    )
+    parser.add_argument(
+        "--slot-name-weight", type=float, default=1., help="loss weight for slot name sequences"
+    )
+    parser.add_argument(
+        "--non-copied-value-weight", type=float, default=1.,
+        help="loss weight for non-copied slot value sequences"
     )
     parser.add_argument(
         "--no-user-action", default=False, action="store_true",

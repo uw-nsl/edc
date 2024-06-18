@@ -2,22 +2,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, NamedTuple
 
+import time
 from functools import cached_property, partial
 
 import torch
+from torch import cuda
 from torch.nn import functional as f
 from transformers import AutoTokenizer
 
 from .. import utils
-from ..data import get_edc_special_tokens, pred_states_tree, pred_states_one_pass
+from ..data import Task, get_edc_special_tokens, pred_states_tree, pred_states_one_pass
 from .transformer import TransformerModel
 from .patch import BART_SKIP_POS_EMBED
-from .decode import greedy_decode, beam_search_decode
+from .decode import greedy_decode
 
 if TYPE_CHECKING:
     from typing import Any, Optional
 
-    from ..data import EncoderData, DecoderData, EDCSample, TargetDataPath, PredResult
+    from ..data import EncoderData, DecoderData, EDCSample
     from ..types import Tokenizer
     from .decode import DecodeStepResult
 
@@ -42,16 +44,17 @@ class EDCGenState(NamedTuple):
         )
 
 class EDCModel(TransformerModel):
-    def __init__(self, max_rounds: int, **kwargs: Any):
+    def __init__(self, max_rounds: int, measure_forward: bool = False, **kwargs: Any):
         # Number of special tokens
         n_special_tokens = len(get_edc_special_tokens(max_rounds))
 
         super().__init__(n_extra_tokens=n_special_tokens, **kwargs)
 
         self.max_rounds = max_rounds
+        self.measure_forward = measure_forward
 
         # Save hyper-parameters of model
-        self.save_hyperparameters(ignore=self.CKPT_IGNORED_HPARAMS)
+        self.save_hyperparameters(ignore=[*self.CKPT_IGNORED_HPARAMS, "measure_forward"])
     
     def _decoder_embed(self, token_ids: torch.Tensor, pos_ids: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
@@ -72,8 +75,28 @@ class EDCModel(TransformerModel):
     
     def _tv_step(self, sample: EDCSample, metric_prefix: str = "") -> torch.Tensor:
         encoder_data, decoder_data = sample
+
+        # Start measuring execution time
+        measure_forward = self.measure_forward and self.device.type=="cuda"
+        if measure_forward:
+            forward_start = cuda.Event(enable_timing=True)
+            forward_end = cuda.Event(enable_timing=True)
+
+            forward_start.record()
+        
         # Compute loss and metrics
         loss, metrics = self(encoder_data, decoder_data)
+
+        # End measuring
+        if measure_forward:
+            forward_end.record()
+            cuda.synchronize()
+        
+            forward_time = forward_start.elapsed_time(forward_end)
+            self.log(
+                metric_prefix+"forward_time", forward_time, batch_size=1,
+                on_step=False, on_epoch=True, reduce_fx="sum", sync_dist=True
+            )
 
         # Log loss and metrics
         self.log(metric_prefix+"loss", loss, batch_size=1, sync_dist=True)
@@ -180,13 +203,18 @@ class EDCModel(TransformerModel):
         # Logits and target token IDs
         target_logits = self.lm_head(decoder_feats[:, :-1][target_mask])
         target_ids = decoder_data.target_token_ids[:, 1:][target_mask]
+        # Target sequence weights
+        target_weights = decoder_data.target_weights.unsqueeze(-1).expand_as(target_mask)
+        target_weights = target_weights[target_mask]
 
-        # Cross entropy losses
-        l = f.cross_entropy(target_logits, target_ids)
+        # Cross entropy for tokens
+        ce_tokens = f.cross_entropy(target_logits, target_ids, reduction="none")
+        # Loss
+        loss = (ce_tokens*target_weights).mean()
         # Accuracy
-        acc = (target_logits.argmax(-1)==target_ids).float().mean()
+        accuracy = (target_logits.argmax(-1)==target_ids).float().mean()
         
-        return l, {"accuracy": acc}
+        return loss, {"accuracy": accuracy}
 
     def training_step(self, sample: EDCSample, _: int) -> torch.Tensor:
         return self._tv_step(sample)
